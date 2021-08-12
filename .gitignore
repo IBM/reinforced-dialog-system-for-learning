@@ -1,0 +1,12 @@
+
+__pycache__/
+.DS_Store
+*.py[cod]
+
+# PyCharm
+.idea/
+
+# models, data files etc.
+saved_models/
+za/
+
