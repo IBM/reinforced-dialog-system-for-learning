@@ -1,0 +1,19 @@
+name: kcds
+channels:
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.7
+  - pip=20.2.2
+  - pytorch==1.6.0
+  - mysql-connector-python
+  - pip:
+    - mlflow
+    - tensorboard
+    - tqdm
+    - transformers==3.1.0
+    - datasets
+    - ujson
+    - nlg-eval
+    - accelerate
+    - rouge-score
