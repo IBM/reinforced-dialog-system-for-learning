@@ -1,9 +1,26 @@
 import csv
 import mysql.connector
-import time
+
+'''
+This script load psgs_w100.tsv into mysql
+psgs_w100.tsv contains the entire Wikipedia
+To download psgs_w100.tsv you need the following steps:
+    git clone https://github.com/facebookresearch/DPR
+    cd DPR
+    python dpr/data/download_data.py --resource data.wikipedia_split.psgs_w100
+
+You would also need to create a database called Wikipedia
+In Wikipedia create a table called passages
+CREATE TABLE `wikipedia`.`passages` (
+  `idx` INT NOT NULL AUTO_INCREMENT,
+  `title` VARCHAR(256) NULL,
+  `passage` MEDIUMTEXT NULL,
+  PRIMARY KEY (`idx`));
+'''
 
 
-path_in = '/Users/cps/PycharmProjects/DPR/dpr/downloads/data/wikipedia_split/psgs_w100.tsv'
+path_in = '/path/to/psgs_w100.tsv'
+
 
 mydb = mysql.connector.connect(user='root', password='root1111',
                               host='127.0.0.1', database='wikipedia',
