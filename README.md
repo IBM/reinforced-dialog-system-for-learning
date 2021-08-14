@@ -1,9 +1,14 @@
-# Talk
+# Talk, do not read
 
 This is the repo for using self-play and reinforcement learning to train a dialogue agent.
-To install the environment, please refer to [This Github Repo](https://github.com/shrimai/Focused-Attention-Improves-Document-Grounded-Generation)
-(Pengshan has build a virtual env called **wow** on his softlayer machine *cai.sl.cloud9.ibm.com*, you may use that directly)
 
+## Install the environment
+We recommend creating a CONDA environment by
+```bash
+conda env create -f conda_env.yml
+```
+
+## Data preparation
 Please prepare the data in another directory (you may name it *Talk_* ) under the same 
 ```shell script
 mkdir -p ../Talk_/data/WoW-raw
@@ -35,6 +40,7 @@ python scripts/prepare_wow_wiz_app/prepare_wow_1.1.py
 ```
 (Difference between 1.1 and 1.6: Entire document as input to wizard - 1.1; Single sentence as input to wizard - 1.6)
 
+## Train models
 To train the wizard model, run the following command line
 
 ```shell script
@@ -53,6 +59,7 @@ To fine-tune the selector model using RL, run the following command line
 python shell/train/rl_self_play_1.5.sh
 ```
 
+## Demo
 Some self-play demos could be found in the folder *./demos* 
 
 
