@@ -1,17 +1,15 @@
-import argparse
 import datasets
 from datasets import load_dataset, load_metric
 from transformers import (
-    CONFIG_MAPPING,
     MODEL_MAPPING
 )
 from utils.self_play_infra_utils import *
-from utils.self_play_model_utils import *
-import random
 from accelerate import Accelerator
 import pickle
 from utils.reward_utils import *
+from utils.self_play_train_utils import *
 from consts import *
+
 
 
 logger = logging.get_logger(__name__)
@@ -34,15 +32,7 @@ def parse_args():
     parser.add_argument(
         "--eval_size", type=int, default=None, help="Number of instances used for validation"
     )
-    # parser.add_argument(
-    #     "--max_length",
-    #     type=int,
-    #     default=128,
-    #     help=(
-    #         "The maximum total input sequence length after tokenization. Sequences longer than this will be truncated,"
-    #         " sequences shorter will be padded if `--pad_to_max_lengh` is passed."
-    #     ),
-    # )
+
     parser.add_argument(
         "--num_turns",
         type=int,
@@ -65,12 +55,6 @@ def parse_args():
         "--pad_to_max_length",
         action="store_true",
         help="If passed, pad all samples to `max_length`. Otherwise, dynamic padding is used.",
-    )
-    parser.add_argument(
-        "--model_name_or_path",
-        type=str,
-        help="Path to pretrained model or model identifier from huggingface.co/models.",
-        required=True,
     )
     parser.add_argument(
         "--config_name",
@@ -104,13 +88,6 @@ def parse_args():
         help="Total number of training steps to perform. If provided, overrides num_train_epochs.",
     )
     parser.add_argument(
-        "--lr_scheduler_type",
-        type=SchedulerType,
-        default="linear",
-        help="The scheduler type to use.",
-        choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"],
-    )
-    parser.add_argument(
         "--save_steps", type=int, default=1000, help="Number of steps to save a model"
     )
     parser.add_argument(
@@ -128,6 +105,11 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
+        "--sel_path",
+        default=None,
+        help="Path or name of the selector model"
+    )
+    parser.add_argument(
         "--wiz_path",
         default=None,
         help="Path to pretrained wizard model"
@@ -137,7 +119,29 @@ def parse_args():
         default=None,
         help="Path to pretrained apprentice model"
     )
-
+    parser.add_argument(
+        "--coh_path",
+        default=None,
+        help="Path to pretrained coherence model"
+    )
+    parser.add_argument(
+        "--alpha_cov",
+        type=float,
+        default=0.9,
+        help="weight for coverage score"
+    )
+    parser.add_argument(
+        "--alpha_coh",
+        type=float,
+        default=0.1,
+        help="weight for coherence score"
+    )
+    parser.add_argument(
+        "--selector_type",
+        type=str,
+        default='post',
+        help="to apply post selector or pre selector"
+    )
     args = parser.parse_args()
     if args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
@@ -146,11 +150,12 @@ def parse_args():
 
 def main():
     args = parse_args()
-    with open('../Talk_/za/args/args_self_play_rl.pkl', 'wb') as f:
+    with open(BASE_PATH + 'za/args/args_self_play_rl.pkl', 'wb') as f:
         pickle.dump(args, f)
     # exit()
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     accelerator = Accelerator()
+    device = accelerator.device
     logger.info(accelerator.state)
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
@@ -164,61 +169,60 @@ def main():
     transformers.utils.logging.set_verbosity(log_level)
     transformers.utils.logging.enable_default_handler()
 
-    # get model config
-    if args.config_name:
-        config = AutoConfig.from_pretrained(args.model_name_or_path)
-    elif args.model_name_or_path:
-        config = AutoConfig.from_pretrained(args.model_name_or_path)
-    else:
-        config = CONFIG_MAPPING[args.model_type]()
-        logger.warning("You are instantiating a new config instance from scratch.")
-
     # selector
-    with open('./za/args/args_self_play.pkl', 'rb') as f:
+    with open(BASE_PATH + 'za/args/args_self_play.pkl', 'rb') as f:
         args_sel = pickle.load(f)
-        args_sel.model_file_path = args.model_name_or_path
-
-    sel = BertSel(args_sel)
+        args_sel.model_name_or_path = args.sel_path
+    sel = Selector(args_sel, device)
 
     # wizard
-    with open('../Talk_/za/args/args_doha_train.pkl', 'rb') as f:
+    with open(BASE_PATH + 'za/args/args_doha_train.pkl', 'rb') as f:
         args_wiz = pickle.load(f)
         args_wiz.experiment_type = 'chat_document'
         args_wiz.model_file_path = args.wiz_path
-    wiz = MultiBartQA(args_wiz)
+    wiz = MultiBartQA(args_wiz, device)
 
     # apprentice
-    with open('../Talk_/za/args/args_bart_train.pkl', 'rb') as f:
+    with open(BASE_PATH + 'za/args/args_bart_train.pkl', 'rb') as f:
         args_app = pickle.load(f)
         args_app.experiment_type = 'chat_document'
         args_app.model_file_path = args.app_path
-    app = BartQA(args_app)
+    app = BartQA(args_app, device)
+
+
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
     no_decay = ["bias", "LayerNorm.weight"]
     optimizer_grouped_parameters = [
         {
-            "params": [p for n, p in sel.model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "params": [p for n, p in sel.selector.named_parameters() if not any(nd in n for nd in no_decay)],
             "weight_decay": args.weight_decay,
         },
         {
-            "params": [p for n, p in sel.model.named_parameters() if any(nd in n for nd in no_decay)],
+            "params": [p for n, p in sel.selector.named_parameters() if any(nd in n for nd in no_decay)],
             "weight_decay": 0.0,
         },
     ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
-    # device = accelerator.device
-    # sel.to(device)
     wiz, app, sel, optimizer = accelerator.prepare(wiz, app, sel, optimizer)
 
-    # Get scorers
-    scorer_coverage = CoverageScorer()
-    alpha_coverage = 1.0
-    scorers = [scorer_coverage]
-    alphas = [alpha_coverage]
+    # coverage scorers
+    scorer_cov = CoverageScorer()
+    # coherence scorer
+    with open(BASE_PATH + 'za/args/args_coh.pkl', 'rb') as f:
+        args_coh = pickle.load(f)
+        args_coh.model_name_or_path = args.coh_path
+    scorer_coh = CoherenceScorer(args_coh, accelerator.device)
+    scorers = [scorer_cov, scorer_coh]
+    alphas = [args.alpha_cov, args.alpha_coh]
 
-    trainer = RLTrainer(args, wiz, app, sel, scorers, alphas, optimizer, accelerator)
+    if args.selector_type == 'post':
+        trainer = RLTrainerForPostSelector(args, wiz, app, sel, scorers, alphas, optimizer, accelerator)
+    elif args.selector_type == 'pre':
+        trainer = RLTrainerForPreSelector(args, wiz, app, sel, scorers, alphas, optimizer, accelerator)
+    else:
+        raise NotImplementedError
 
     assert args.train_file is not None or args.validation_file is not None
     data_files = {}
