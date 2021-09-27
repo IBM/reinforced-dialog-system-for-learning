@@ -875,7 +875,7 @@ class MultiBartQA:
             if self.args.experiment_type == 'doc_only':
                 document = 'document: ' + e.context
             elif self.args.experiment_type == 'chat_document':
-                document = 'chat: ' + e.source + 'document: ' + e.context
+                document = 'chat: ' + e.source + ' document: ' + e.context
             elif self.args.experiment_type == 'chat_wizard':
                 context = e.context
                 context = ast.literal_eval(context)
@@ -1135,7 +1135,6 @@ class MultiBartQA:
             for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
                 source_ids, source_mask, target_ids, target_labels, doc_ids, doc_mask, batch_total_tokens = self.get_train_batch_data(
                     batch)
-
                 source_reps, doc_reps = self.encode(source_ids, source_mask, doc_ids, doc_mask)
                 outputs = self.generator(input_ids=None,
                                          attention_mask=(source_mask, doc_mask),
@@ -1405,31 +1404,72 @@ class Selector:
             config=self.config,
         )
         sys.stdout.flush()
-        self.tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
-        num_added_toks = self.tokenizer.add_tokens(DOC_TOKEN)
-        print('We have added', num_added_toks, 'tokens')
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
+        except:
+            self.tokenizer = AutoTokenizer.from_pretrained('roberta-base', use_fast=not args.use_slow_tokenizer)
+        # num_added_toks = self.tokenizer.add_tokens(DOC_TOKEN)
+        # print('We have added', num_added_toks, 'tokens')
         self.selector.resize_token_embeddings(len(self.tokenizer))
         self.selector.to(self.device)
 
-    def select(self, sents, history, document=None):
-        history = history.replace('</s>', '\\')
-        if document:
-            context = history + DOC_TOKEN + document.replace('\\', '')
+    def select(self, sents_batch, histories_batch, documents_batch=None):
+        # sents could either be utterance (post-sel) or reference (pre-sel)
+        if type(histories_batch) == str:
+            history = histories_batch.replace('</s>', '\\')
+            if documents_batch:
+                context = history + '</s>' + documents_batch.replace('\\', '')
+            else:
+                context = history
+            inputs = self.tokenizer(
+                sents_batch,
+                [context] * len(sents_batch),
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+                max_length=self.args.max_length
+            ).to(self.device)
+            for key in inputs:
+                inputs[key] = torch.unsqueeze(inputs[key], dim=0)
+            outputs = self.selector(**inputs)
+            probs = softmax(outputs[0], dim=1)
+            return probs
         else:
-            context = history
-        inputs = self.tokenizer(
-            sents,
-            [context] * len(sents),
-            padding=True,
-            truncation=True,
-            return_tensors="pt",
-            max_length=self.args.max_length
-        ).to(self.device)
-        for key in inputs:
-            inputs[key] = torch.unsqueeze(inputs[key], dim=0)
-        outputs = self.selector(**inputs)
-        probs = softmax(outputs[0], dim=1)
-        return probs
+            assert type(histories_batch) == list
+            histories_batch_ = [history.replace('</s>', '\\') for history in histories_batch]
+            if documents_batch:
+                assert len(histories_batch_) == len(documents_batch)
+                contexts_batch = [histories_batch_[k] + '</s>' + documents_batch[k].replace('\\', '') for k in range(len(histories_batch_))]
+            else:
+                contexts_batch = histories_batch_
+            indexes_references = []
+            sents_batch_ = []
+            contexts_batch_ = []
+            index_now = 0
+            # squeeze the references (batch_size, num_reference) into references_ (batch_size * num_reference)
+            for context, sents in zip(contexts_batch, sents_batch):
+                sents_batch_ += sents
+                contexts_batch_ += [context] * len(sents)
+                indexes_references.append((index_now, index_now + len(sents)))
+                index_now += len(sents)
+            inputs = self.tokenizer(
+                sents_batch_,
+                contexts_batch_,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+                max_length=self.args.max_length
+            ).to(self.device)
+            for key in inputs:
+                inputs[key] = torch.unsqueeze(inputs[key], dim=0)
+            outputs = self.selector(**inputs)
+            # unsqueeze the output
+            probs_batch = torch.zeros((len(sents_batch), max(len(sents) for sents in sents_batch)))
+            for k, (index_start, index_end) in enumerate(indexes_references):
+                output = outputs[0][0][index_start: index_end]
+                # probs_batch.append(softmax(output, dim=0))
+                probs_batch[k][:output.shape[0]] = softmax(output)
+            return probs_batch
 
     def save_model(self, output_dir, save_name):
         save_dir = output_dir + save_name + '/'
@@ -1554,45 +1594,81 @@ def select_response(says, history, thresh=0.6):
 
 def doha_generate(robot, topic, history, doc, num_return_sequences):
     assert type(robot) == MultiBartQA
-    history_ = '</s>'.join(history.split('</s>'))
-    source_str = 'chat: %s%s%s' % (topic, robot.tokenizer.sep_token, history_)
-    source_ids = robot.tokenizer.encode(source_str, max_length=1024, truncation=True, return_tensors='pt').to(robot.device)
-    doc_str = source_str + 'document: ' + doc
-    doc_ids = robot.tokenizer.encode(doc_str, max_length=1024, truncation=True, return_tensors='pt').to(robot.device)
-    source_mask = torch.ones_like(source_ids).to(robot.device)
-    doc_mask = torch.ones_like(doc_ids).to(robot.device)
-    with torch.no_grad():
-        source_reps, doc_reps = robot.encode(source_ids, source_mask, doc_ids, doc_mask)
-        predicted_ids = robot.generator.generate(
-            input_ids=source_mask,
-            attention_mask=(source_mask, doc_mask),
-            encoder_outputs=(source_reps, doc_reps),
-            num_beams=1,
-            max_length=robot.args.target_max_len,
-            early_stopping=True,
-            do_sample=True,
-            temperature=1.0,
-            top_k=0,
-            top_p=0.9,
-            num_return_sequences=num_return_sequences
-        )
-    says = decode_output(predicted_ids, robot)
-    if type(says) is str:
-        says = [says]
+    if type(history) == str:
+        # history_ = '</s'.join(history.split('</s>'))
+        source_str = '%s%s%s' % (topic, robot.tokenizer.sep_token, history)
+        source_ids = robot.tokenizer.encode(source_str, max_length=1024, truncation=True, return_tensors='pt').to(
+            robot.device)
+        doc_str = source_str + ' </s> ' + doc
+        doc_ids = robot.tokenizer.encode(doc_str, max_length=1024, truncation=True, return_tensors='pt').to(
+            robot.device)
+        source_mask = torch.ones_like(source_ids).to(robot.device)
+        doc_mask = torch.ones_like(doc_ids).to(robot.device)
+        with torch.no_grad():
+            source_reps, doc_reps = robot.encode(source_ids, source_mask, doc_ids, doc_mask)
+            predicted_ids = robot.generator.generate(
+                input_ids=source_mask,
+                attention_mask=(source_mask, doc_mask),
+                encoder_outputs=(source_reps, doc_reps),
+                num_beams=1,
+                max_length=robot.args.target_max_len,
+                early_stopping=True,
+                do_sample=True,
+                temperature=1.0,
+                top_k=0,
+                top_p=0.9,
+                num_return_sequences=num_return_sequences
+            )
+        says = decode_output(predicted_ids, robot)
+        if type(says) is str:
+            says = [says]
+        else:
+            assert type(says) is list
+        return says
     else:
-        assert type(says) is list
-    return says
+        assert type(history) == list and type(history[0]) == str
+        source_strs = ['%s%s%s' % (rec_topic, robot.tokenizer.sep_token, rec_history_) for (rec_topic, rec_history_) in
+                       zip(topic, history)]
+        source = robot.tokenizer(source_strs, max_length=1024, padding=True, truncation=True, return_tensors='pt').to(
+            robot.device)
+        doc_str = [source_str + '</s>' + rec_doc for (source_str, rec_doc) in zip(source_strs, doc)]
+        doc = robot.tokenizer(doc_str, max_length=1024, padding=True, truncation=True, return_tensors='pt').to(
+            robot.device)
+        # source_mask = torch.ones_like(source_ids).to(robot.device)
+        # doc_mask = torch.ones_like(doc_ids).to(robot.device)
+        with torch.no_grad():
+            source_reps, doc_reps = robot.encode(source['input_ids'], source['attention_mask'], doc['input_ids'],
+                                                 doc['attention_mask'])
+            predicted_ids = robot.generator.generate(
+                input_ids=source['attention_mask'],
+                attention_mask=(source['attention_mask'], doc['attention_mask']),
+                encoder_outputs=(source_reps, doc_reps),
+                num_beams=1,
+                max_length=robot.args.target_max_len,
+                early_stopping=True,
+                do_sample=True,
+                temperature=1.0,
+                top_k=0,
+                top_p=0.9,
+                num_return_sequences=num_return_sequences
+            )
+        says = decode_output(predicted_ids, robot)
+        if type(says) is str:
+            says = [says]
+        else:
+            assert type(says) is list
+        return says
 
 
-def bart_generate(robot, history, num_return_sequences=10):
+def bart_generate(robot, history, num_return_sequences=16):
     assert type(robot) == BartQA
-    history_ = '</s>'.join(history.split('</s>'))
-    source_str = 'chat: %s' % history_
-    source_ids = robot.tokenizer.encode(source_str, max_length=1024, truncation=True, return_tensors='pt').to(robot.device)
-    source_mask = torch.ones_like(source_ids).to(robot.device)
+    # source_str = history
+    inputs = robot.tokenizer(history, max_length=1024, truncation=True, padding=True, return_tensors='pt').to(
+        robot.device)
+    # source_mask = torch.ones_like(source_ids).to(robot.device)
     with torch.no_grad():
-        predicted_ids = robot.generator.generate(input_ids=source_ids,
-                                                 attention_mask=source_mask,
+        predicted_ids = robot.generator.generate(input_ids=inputs['input_ids'],
+                                                 attention_mask=inputs['attention_mask'],
                                                  num_beams=3,
                                                  do_sample=True,
                                                  max_length=robot.args.target_max_len,
@@ -1602,25 +1678,41 @@ def bart_generate(robot, history, num_return_sequences=10):
                                                  num_return_sequences=num_return_sequences
                                                  )
     says = decode_output(predicted_ids, robot)
-    if type(says) is str:
-        say = says
+    if type(history) == str:
+        if type(says) is str:
+            say = says
+        else:
+            assert type(says) is list
+            say = select_response(says, history)
+        return say
     else:
-        assert type(says) is list
-        say = select_response(says, history)
-    return say
+        assert type(history) == list and type(history[0]) == str
+        says_groups = [says[i*num_return_sequences: (i+1)*num_return_sequences] for i in range(len(history))]
+        says_selected = []
+        for (says_group, rec_history) in zip(says_groups, history):
+            say = select_response(says_group, rec_history)
+            says_selected.append(say)
+        return says_selected
 
 
 def update_history(history, say, charactor=None, reverse=False):
-    if charactor:
-        return history + charactor + ': ' + say
-    else:
-        if history == '':
-            return say
+    if type(history) == str:
+        if charactor:
+            return history + charactor + ': ' + say
         else:
-            if reverse:
-                return say + '</s>' + history
+            if history == '':
+                return say
             else:
-                return history + '</s>' + say
+                if reverse:
+                    return say + '</s>' + history
+                else:
+                    return history + '</s>' + say
+    else:
+        assert type(history) == list and type(history[0]) == str and type(say) == list
+        history_ = []
+        for rec_history, rec_say in zip(history, say):
+            history_.append(update_history(rec_history, rec_say, charactor, reverse))
+        return history_
 
 
 def parse_conversation_history(history, reverse):
@@ -1641,82 +1733,26 @@ def make_conversation_no_sel(wiz, app, topic, doc, num_turns, reverse=True):
     return parse_conversation_history(history, reverse=reverse)
 
 
+class DataloaderRL:
+    def __init__(self, dataset, batch_size, shuffle=False):
+        self.num_steps = math.floor(len(dataset)/batch_size)
+        self.indexes = list(range(len(dataset)))
+        self.shuffle = shuffle
+        if self.shuffle:
+            random.shuffle(self.indexes)
+        self.step = 0
+        self.batch_size = batch_size
+        self.dataset = dataset
 
-
-# class BertSel:
-#     def __init__(self, args, device=None):
-#         self.args = args
-#         if device is not None:
-#             self.device=device
-#         else:
-#             self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-#         self.config = AutoConfig.from_pretrained(args.model_name_or_path)
-#         # assert os.path.exists(self.args.model_file_path)
-#         print('Loading exisitng model at ' + str(self.args.model_file_path))
-#         sys.stdout.flush()
-#         self.model = AutoModelForMultipleChoice.from_pretrained(
-#             args.model_file_path,
-#             config=self.config,
-#         )
-#         self.tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
-#         self.data_collator = DataCollatorForResponseSelectorEval(
-#             self.tokenizer, pad_to_multiple_of=(None)
-#         )
-#         self.model.eval()
-#         self.model.to(self.device)
-#
-#     # def preprocess_function(self, examples):
-#     #     part1 = examples['response']
-#     #     part2 = examples['context']
-#     #     if 'labels' in examples:
-#     #         labels = examples['labels']
-#     #     # Tokenize
-#     #     tokenized_examples = self.tokenizer(
-#     #         part1,
-#     #         part2,
-#     #         truncation=True,
-#     #         max_length=self.args.max_length,
-#     #         padding="max_length" if self.args.pad_to_max_length else False
-#     #     )
-#     #     # Un-flatten
-#     #     tokenized_inputs = {
-#     #         k: [v[i: i + len(part1)] for i in range(0, len(v), len(part1))] for k, v in
-#     #         tokenized_examples.items()}
-#     #     if 'labels' in examples:
-#     #         tokenized_inputs["labels"] = labels
-#     #     return tokenized_inputs
-#
-#     # def reformat_input(self, says, history):
-#         # info_dict = {
-#         #     'context': [history] * len(says),
-#         #     'response': says
-#         # }
-#         # info_dataset = Dataset.from_dict(info_dict)
-#         # info_dataset_ = info_dataset.map(self.preprocess_function, batched=True, remove_columns=info_dataset.column_names)
-#         # loader = DataLoader(info_dataset_, shuffle=True, collate_fn=self.data_collator,
-#         #                 batch_size=len(says))
-#         # for batch in loader:
-#         #     break
-#         # return batch
-#
-#     def select(self, says, history):
-#         # inputs = self.reformat_input(says, history)
-#         inputs = self.tokenizer(
-#             says,
-#             [history] * len(says),
-#             padding=True,
-#             truncation=True,
-#             return_tensors="pt",
-#             max_length=self.args.max_length
-#         )
-#         for key in inputs:
-#             inputs[key] = torch.unsqueeze(inputs[key], dim=0).to(self.device)
-#         outputs = self.model(**inputs)
-#         probs = softmax(outputs[0], dim=1)
-#         return probs
-#
-#     def save_model(self, output_dir, save_name):
-#         save_dir = output_dir + save_name + '/'
-#         if not os.path.exists(save_dir):
-#             os.mkdir(save_dir)
-#         self.model.save_pretrained(save_dir)
+    def get_next_batch(self):
+        start_idx = self.step * self.batch_size
+        end_idx = (self.step + 1) * self.batch_size
+        if end_idx > len(self.indexes):
+            self.step = 0
+            if self.shuffle:
+                random.shuffle(self.indexes)
+            start_idx = self.step * self.batch_size
+            end_idx = (self.step + 1) * self.batch_size
+        indexes_batch = self.indexes[start_idx: end_idx]
+        batch = self.dataset[indexes_batch]
+        return batch
