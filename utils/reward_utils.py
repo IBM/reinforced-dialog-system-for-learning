@@ -52,8 +52,10 @@ class LanguageModelScorer:
 
 
 class CoverageScorer:
-    def __init__(self):
+    def __init__(self, max_cov_score=1.0):
         self.scorer = rouge_scorer.RougeScorer(['rouge1'], use_stemmer=True)
+        self.max_cov_score = max_cov_score
+        self.tokenizer = BartTokenizer.from_pretrained('facebook/bart-base')
         # self.scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2'], use_stemmer=True)
 
     def score_conversation(self, history, document):
@@ -79,6 +81,21 @@ class CoverageScorer:
                 scores_batch.append(self.score_utterance(history, document))
             return scores_batch
 
+    def get_lengthy_penalty_scale(self, response):
+        response_length = len(self.tokenizer.tokenize(response))
+        if response_length < 10:
+            return 0.1 * response_length
+        elif response_length <= 50:
+            return 1.0
+        elif 50 < response_length <= 60:
+            return 0.9
+        elif 60 < response_length <= 70:
+            return 0.7
+        elif 70 < response_length <= 80:
+            return 0.5
+        else:
+            return 0.3
+
     def score_utterance_for_generator(self, responses, histories, documents):
         assert type(histories) == list
         assert len(responses) == len(histories) == len(documents)
@@ -86,15 +103,16 @@ class CoverageScorer:
         for (response, history, document) in zip(responses, histories, documents):
             cov_old = self.scorer.score(document, history)
             cov_new = self.scorer.score(document, history + response)
-            cov_score.append(cov_new['rouge1'].fmeasure - cov_old['rouge1'].fmeasure)
+            score_diff = min(max(cov_new['rouge1'].fmeasure - cov_old['rouge1'].fmeasure, 0), self.max_cov_score)
+            cov_score.append(score_diff)
         return np.array(cov_score)
 
     def score_conversation_for_generator(self, histories, documents):
         cov_scores = []
         uttrs = [history.split(' / ') for history in histories]
         uttrs_wiz = [' / '.join([uttr for j, uttr in enumerate(uttrs[i]) if j % 2 == 0]) for i in range(len(uttrs))]
-        for uttr, document in zip(uttrs_wiz, documents):
-            cov_score = self.scorer.score(document, uttr)
+        for uttr_wiz, document in zip(uttrs_wiz, documents):
+            cov_score = self.scorer.score(document, uttr_wiz)
             cov_scores.append(cov_score['rouge1'].fmeasure)
         return cov_scores
 
@@ -183,3 +201,7 @@ class CoherenceScorer:
                 coh_scores_conv.append(self.score_utterance(uttr_app, uttr_wiz, 1.0))
             coh_scores.append(np.mean(coh_scores_conv))
         return coh_scores
+
+
+
+

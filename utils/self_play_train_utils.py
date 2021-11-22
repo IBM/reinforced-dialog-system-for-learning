@@ -1,7 +1,6 @@
 import math
 import random
 from datetime import datetime
-
 import numpy as np
 import torch
 from nltk import sent_tokenize
@@ -28,7 +27,7 @@ class RLTrainerForSelector:
         self.accelerator = accelerator
         self.wiz.generator.eval()
         self.app.generator.eval()
-        self.scorer_c = CoverageScorer()
+        self.scorer_c = CoverageScorer(max_cov_score=args.max_cov_score)
         if not args.log_dir.endswith('.txt'):
             self.log_dir = args.log_dir + '/log.txt'
         else:
@@ -434,17 +433,18 @@ class RLTrainerForGenerator:
         assert len(alphas) == 2
         self.alpha_cov, self.alpha_coh = alphas
         self.accelerator = accelerator
-        optimizer = self.wiz.get_optimizer()
-        self.optimizer = self.accelerator.prepare(optimizer)
-        self.scheduler = get_linear_schedule_with_warmup(optimizer,
+        self.optimizer = self.accelerator.prepare(self.wiz.get_optimizer())
+        self.scheduler = get_linear_schedule_with_warmup(self.optimizer,
                                                     num_warmup_steps=int(self.args.warmup_steps),
                                                     num_training_steps=self.args.max_train_steps)
+        self.tokenizer = BartTokenizer.from_pretrained('facebook/bart-base')
         if not args.log_dir.endswith('.txt'):
             self.log_dir = args.log_dir + '/log.txt'
         else:
             self.log_dir = args.log_dir
-        with open(self.log_dir, 'w') as f:
-            f.write('***** Running RL Fine-tuning *****\n')
+        if self.args.write_to_log:
+            with open(self.log_dir, 'w') as f:
+                f.write('***** Running RL Fine-tuning *****\n')
         self.start_time = datetime.now()
         if not os.path.exists(self.args.output_dir):
             os.mkdir(self.args.output_dir)
@@ -463,7 +463,7 @@ class RLTrainerForGenerator:
             predicted_ids = self.wiz.generator.generate(input_ids=source_mask,
                                                         attention_mask=(source_mask, doc_mask),
                                                         encoder_outputs=(source_reps, doc_reps),
-                                                        num_beams=1,
+                                                        num_beams=3,
                                                         max_length=self.args.max_target_length,
                                                         early_stopping=True,
                                                         do_sample=True,
@@ -566,23 +566,30 @@ class RLTrainerForGenerator:
             log_probs = torch.stack(log_probs, dim=1)
             decoder_padding_mask = torch.stack(decoder_padding_mask, dim=1)
             log_probs = log_probs * decoder_padding_mask
-            lens = torch.sum(decoder_padding_mask, dim=1)
+            # lens = torch.sum(decoder_padding_mask, dim=1)
+            lens_ = torch.unsqueeze(torch.sum(decoder_padding_mask, dim=1), dim=0)
+            lens = torch.max(torch.cat((lens_, torch.ones_like(lens_, dtype=lens_.dtype)), dim=0), dim=0).values
             log_probs = torch.sum(log_probs, dim=1) / lens
         responses = self.wiz.tokenizer.batch_decode(predict_ids, skip_special_tokens=True)
         return responses, log_probs
 
-    def select_app_response(self, responses_all, histories, thresh=0.6):
+    def select_app_response(self, responses_all, histories, thresh=0.5):
         assert len(responses_all) == len(histories) * self.args.num_candidates
         responses_selected = []
         for i, history in enumerate(histories):
             responses_ = responses_all[i * self.args.num_candidates: (i + 1) * self.args.num_candidates]
             previous_responses = [rec for i, rec in enumerate(history.split(' / ')) if i % 2 == 1]
-            if len(previous_responses) == 0:
+            if len(self.app.response_cache) > self.args.num_cached_responses:
+                cached_responses = random.choices(self.app.response_cache, k=self.args.num_cached_responses)
+            else:
+                cached_responses = self.app.response_cache
+            reference_responses = previous_responses + cached_responses
+            if len(reference_responses) == 0:
                 responses_selected.append(random.choice(responses_))
                 continue
             cand2score = {}
             for j, response in enumerate(responses_):
-                refs = {j: previous_responses}
+                refs = {j: reference_responses}
                 hyps = {j: [response]}
                 (b1, b2, b3), _ = bleu.compute_score(refs, hyps)
                 cand2score[response] = b2
@@ -592,7 +599,7 @@ class RLTrainerForGenerator:
             except:
                 cand_ranked = sorted(cand2score.items(), key=lambda kv: kv[1])
                 selection_pool = [cand_ranked[0][0]]
-                print('Overlapping warning')
+                print("Warning: Apprentice's responses may have low diversity")
             responses_selected.append(random.choice(selection_pool))
         return responses_selected
 
@@ -614,7 +621,29 @@ class RLTrainerForGenerator:
                                                         )
         responses_all = self.app.tokenizer.batch_decode(predicted_ids, skip_special_tokens=True)
         responses_selected = self.select_app_response(responses_all, histories)
+        self.app.update_response_history(random.choices(responses_selected, k=2))
         return responses_selected
+
+    def get_lengthy_penalty_scale(self, responses):
+        # penalize responses that are too long or too short
+        penalty_scales = []
+        for response in responses:
+            response_length = len(self.tokenizer.tokenize(response))
+            if response_length < 3:
+                penalty_scales.append(0.0)
+            elif response_length < 10:
+                penalty_scales.append(0.1 * response_length)
+            elif response_length <= 45:
+                penalty_scales.append(1.0)
+            elif 45 < response_length <= 55:
+                penalty_scales.append(0.7)
+            elif 55 < response_length <= 65:
+                penalty_scales.append(0.5)
+            elif 65 < response_length <= 75:
+                penalty_scales.append(0.3)
+            else:
+                penalty_scales.append(0.1)
+        return np.array(penalty_scales)
 
     def get_reward_score(self, responses, histories, documents):
         cov_scores = self.scorer_cov.score_utterance_for_generator(responses, histories, documents)
@@ -626,7 +655,7 @@ class RLTrainerForGenerator:
                 coh_scores = np.zeros(len(responses))
         else:
             coh_scores = np.zeros(len(responses))
-        scores = self.alpha_cov * cov_scores + self.alpha_coh * coh_scores
+        scores = (self.alpha_cov * cov_scores + self.alpha_coh * coh_scores) * self.get_lengthy_penalty_scale(responses)
         return scores, (cov_scores, coh_scores)
 
     def finetune_batch_rl(self, batch):
@@ -657,20 +686,19 @@ class RLTrainerForGenerator:
         documents_ = self.wiz.tokenizer(documents_, return_tensors='pt', truncation=True, padding=True)
         doc_ids, doc_mask = documents_['input_ids'].to(self.accelerator.device), documents_['attention_mask'].to(
             self.accelerator.device)
-        try:
-            with torch.no_grad():
-                greedy_responses, _ = self.generate_wiz_response_finetune(source_ids, doc_ids, source_mask, doc_mask,
-                                                                          do_sample=False)
-            sample_responses, RL_log_probs = self.generate_wiz_response_finetune(source_ids, doc_ids, source_mask, doc_mask,
-                                                                                 do_sample=True)
-        except:
-            info = {
-                'source_ids': source_ids,
-                'doc_ids': doc_ids,
-                'source_mask': source_mask,
-                'doc_mask': doc_mask
-            }
-            torch.save(info, '../Talk_/za/info.pt')
+        with torch.no_grad():
+            greedy_responses, _ = self.generate_wiz_response_finetune(source_ids, doc_ids, source_mask, doc_mask,
+                                                                      do_sample=False)
+        sample_responses, RL_log_probs = self.generate_wiz_response_finetune(source_ids, doc_ids, source_mask, doc_mask,
+                                                                             do_sample=True)
+        # except:
+        #     info = {
+        #         'source_ids': source_ids,
+        #         'doc_ids': doc_ids,
+        #         'source_mask': source_mask,
+        #         'doc_mask': doc_mask
+        #     }
+        #     torch.save(info, '../Talk_/za/info.pt')
         sample_scores, (sample_cov_scores, sample_coh_scores) = self.get_reward_score(sample_responses, histories,
                                                                                       documents)
         greedy_scores, (greedy_cov_scores, greedy_coh_scores) = self.get_reward_score(greedy_responses, histories,
@@ -678,25 +706,26 @@ class RLTrainerForGenerator:
         rl_loss = torch.from_numpy(-(sample_scores - greedy_scores)).to(RL_log_probs.device) * RL_log_probs
         rl_loss = torch.mean(rl_loss)
         # check NaN
-        if torch.isnan(rl_loss).sum() > 0:
-            info = {
-                'rl_loss': rl_loss,
-                'RL_log_probs': RL_log_probs,
-                'sample_scores': sample_scores,
-                'greedy_scores': greedy_scores,
-                'topics': topics,
-                'documents': documents,
-                'histories': histories,
-            }
-            torch.save(info, '../Talk_/za/infox.pt')
-
-        self.log("Sample scores | final:%s\tcov: %s\tcoh: %s\nGreedy scores | final:%s\tcov: %s\tcoh: %s" % (
-            round(sample_scores[0], 3), round(sample_cov_scores[0], 3), round(sample_coh_scores[0], 3),
-            round(greedy_scores[0], 3), round(greedy_cov_scores[0], 3), round(greedy_coh_scores[0], 3)))
+        # if torch.isnan(rl_loss).sum() > 0:
+        #     info = {
+        #         'rl_loss': rl_loss,
+        #         'RL_log_probs': RL_log_probs,
+        #         'sample_scores': sample_scores,
+        #         'greedy_scores': greedy_scores,
+        #         'topics': topics,
+        #         'documents': documents,
+        #         'histories': histories,
+        #     }
+        #     torch.save(info, '../Talk_/za/infox.pt')
+        #     exit()
+        self.log("Sample scores | final:%s\tcov: %s\tcoh: %s\tseq_len: %s\nGreedy scores | final:%s\tcov: %s\tcoh: %s\tseq_len: %s" % (
+            round(sample_scores[0], 3), round(sample_cov_scores[0], 3), round(sample_coh_scores[0], 3), len(sample_responses[0].split(' ')),
+            round(greedy_scores[0], 3), round(greedy_cov_scores[0], 3), round(greedy_coh_scores[0], 3), len(greedy_responses[0].split(' '))))
         # Self-critic policy gradient training (eq 15 in https://arxiv.org/pdf/1705.04304.pdf)
         self.optimizer.zero_grad()
         # rl_loss.backward()
         self.accelerator.backward(rl_loss)
+        self.log('RL loss %s' % round(rl_loss.cpu().item(), 3))
         torch.nn.utils.clip_grad_norm_(self.wiz.generator.parameters(), self.args.max_grad_norm)
         self.optimizer.step()
         return sample_responses
@@ -723,7 +752,7 @@ class RLTrainerForGenerator:
         #     'train_ppl': math.exp(min(loss / batch_total_tokens, 100))
         # }
         # print(str(train_stat_curr))
-        self.log("MLE loss: %s | Perplexity: %s" % (mle_loss.item(), math.exp(min(mle_loss / batch_total_tokens, 100))))
+        self.log("MLE loss %s | Perplexity: %s" % (mle_loss.item(), math.exp(min(mle_loss / batch_total_tokens, 100))))
         sys.stdout.flush()
 
     def finetune(self, train_dataset_rl, eval_dataset_rl, train_dataset_mle):
@@ -738,17 +767,18 @@ class RLTrainerForGenerator:
         train_dataloader_mle = iter(self.wiz.get_train_dataloader(train_dataset_mle, self.args.batch_size_mle))
         for step in range(self.args.max_train_steps):
             ins_start_time = datetime.now()
-            if self.args.finetune_mle:
+            if self.args.finetune_mle is True:
                 for _ in range(self.args.num_mle_per_rl):
                     batch_mle = next(train_dataloader_mle)
                     self.finetune_batch_mle(batch_mle)
-            if self.args.finetune_rl:
+            if self.args.finetune_rl is True:
                 batch_rl = train_dataloader_rl.get_next_batch()
                 _ = self.finetune_batch_rl(batch_rl)
             ins_end_time = datetime.now()
             self.log('Step %s | Step time: %s\tTotal time: %s' % (
                 step, str(ins_end_time - ins_start_time).split('.')[0],
                 str(ins_end_time - self.start_time).split('.')[0]))
+            self.scheduler.step()
             progress_bar_train.update(1)
             if step % self.args.eval_steps == 0 and step > 0:
                 self.log('--- Eval epoch %s starts ---' % eval_epoch)
@@ -803,8 +833,9 @@ class RLTrainerForGenerator:
         self.wiz.generator.train()
 
     def log(self, content):
-        with open(self.log_dir, 'a') as f:
-            f.write(content.strip() + '\n')
+        if self.args.write_to_log:
+            with open(self.log_dir, 'a') as f:
+                f.write(content.strip() + '\n')
         print(content.strip())
 
     def update_histories(self, responses, histories, reverse=True):
@@ -831,3 +862,5 @@ class RLTrainerForGenerator:
             documents = ['None' for _ in source]
         documents_ = ['chat: %s document: %s' % (s, d) for s, d in zip(source, documents)]
         return documents_
+
+

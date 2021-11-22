@@ -38,11 +38,7 @@ from transformers.file_utils import (
 )
 from metrics import evaluate_nq
 from bart_decoder import MultiHeadBartForConditionalGeneration
-from utils.self_play_infra_utils import DataCollatorForResponseSelectorEval
 from nlgeval.pycocoevalcap.bleu.bleu import Bleu
-from datasets import Dataset
-from consts import *
-
 
 bleu = Bleu(3)
 
@@ -123,7 +119,6 @@ class BartQA:
         else:
             self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.cpu = torch.device("cpu")
-
         if os.path.exists(self.args.model_file_path):
             print('Loading exisitng model at ' + str(self.args.model_file_path))
             sys.stdout.flush()
@@ -136,6 +131,13 @@ class BartQA:
         self.generator.to(self.device)
         self.tokenizer = BartTokenizer.from_pretrained(
             self.args.model_name)  # Need to add base to "tokenization_bart.py" when using transformers==2.11.0
+        self.response_cache = []
+        self.response_cache_volume = 20
+
+    def update_response_history(self, responses):
+        self.response_cache += responses
+        if len(self.response_cache) > self.response_cache_volume:
+            self.response_cache = self.response_cache[-1 * self.response_cache_volume:]
 
     def save(self, num_updates):
         model_to_save = (
@@ -529,7 +531,6 @@ class BartQA:
         for batch in tqdm(eval_dataloader, desc="Generating"):
             example_indices, source_ids, source_mask, target_ids, \
             target_labels, batch_total_tokens = self.get_eval_batch_data(batch)
-
             with torch.no_grad():
                 outputs = self.generator(input_ids=source_ids,
                                          attention_mask=source_mask,
@@ -1755,4 +1756,5 @@ class DataloaderRL:
             end_idx = (self.step + 1) * self.batch_size
         indexes_batch = self.indexes[start_idx: end_idx]
         batch = self.dataset[indexes_batch]
+        self.step += 1
         return batch
