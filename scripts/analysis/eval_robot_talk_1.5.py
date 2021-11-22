@@ -25,9 +25,9 @@ rewards_last_three = [np.mean(rewards[max(i-3, 0):i+1]) for i in range(len(rewar
 epoches = [(i+1)*600 for i in range(len(rewards))]
 
 l1=plt.plot(epoches, rewards, 'r--', label='rewards')
-l2=plt.plot(epoches, rewards_last_three, 'b--', label='average rewards last three times')
+l2=plt.plot(epoches, rewards_last_three, 'b--', label='rewards average last three')
 
-plt.title('Rouge-2 F1 score on validation set')
+plt.title('Rewards every 600 steps')
 plt.xlabel('Steps')
 plt.ylabel('Rewards')
 plt.legend()

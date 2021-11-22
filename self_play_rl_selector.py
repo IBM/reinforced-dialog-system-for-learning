@@ -9,6 +9,8 @@ from utils.self_play_infra_utils import *
 from utils.self_play_train_utils import *
 from consts import *
 
+
+
 logger = logging.get_logger(__name__)
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
@@ -18,16 +20,10 @@ TMP_PATH = 'tmp/'
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a text classification task")
     parser.add_argument(
-        "--train_file_rl", type=str, default=None, help="A csv or a json file containing the training data."
+        "--train_file", type=str, default=None, help="A csv or a json file containing the training data."
     )
     parser.add_argument(
-        "--validation_file_rl", type=str, default=None, help="A csv or a json file containing the validation data."
-    )
-    parser.add_argument(
-        "--train_file_mle", type=str, default=None, help="A csv or a json file containing the training data."
-    )
-    parser.add_argument(
-        "--validation_file_mle", type=str, default=None, help="A csv or a json file containing the validation data."
+        "--validation_file", type=str, default=None, help="A csv or a json file containing the validation data."
     )
     parser.add_argument(
         "--train_size", type=int, default=None, help="Number of instances used for training"
@@ -39,7 +35,7 @@ def parse_args():
         "--num_turns",
         type=int,
         help="Number of turns in a conversation",
-        default=3
+        default=5
     )
     parser.add_argument(
         "--num_candicates",
@@ -107,12 +103,9 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
-        "--wiz_model_name",
-        default='facebook/bart-base'
-    )
-    parser.add_argument(
-        "--app_model_name",
-        default='facebook/bart-base'
+        "--sel_path",
+        default=None,
+        help="Path or name of the selector model"
     )
     parser.add_argument(
         "--wiz_path",
@@ -148,12 +141,7 @@ def parse_args():
         help="to apply post selector or pre selector"
     )
     parser.add_argument(
-        "--batch_size_mle",
-        type=int,
-        default=8
-    )
-    parser.add_argument(
-        "--batch_size_rl",
+        "--batch_size",
         type=int,
         default=5
     )
@@ -161,26 +149,6 @@ def parse_args():
         "--shuffle",
         type=bool,
         default=True
-    )
-    parser.add_argument(
-        "--max_target_length",
-        type=int,
-        default=128
-    )
-    parser.add_argument(
-        "--max_source_length",
-        type=int,
-        default=1024
-    )
-    parser.add_argument(
-        "--num_candidates",
-        type=int,
-        default=10
-    )
-    parser.add_argument(
-        "--num_mle_per_rl",
-        type=int,
-        default=3
     )
     parser.add_argument(
         "--finetune_mle",
@@ -192,51 +160,19 @@ def parse_args():
         type=bool,
         default=True
     )
-    parser.add_argument(
-        "--cached_train_file_mle",
-        type=str,
-        default=None
-    )
-    parser.add_argument(
-        "--warmup_steps",
-        type=int,
-        default=600
-    )
-    parser.add_argument(
-        "--write_to_log",
-        type=bool,
-        default=True
-    )
-    parser.add_argument(
-        "--num_cached_responses",
-        type=int,
-        default=5
-    )
-    parser.add_argument(
-        "--max_cov_score",
-        type=float,
-        default=0.5
-    )
-    parser.add_argument('--max_grad_norm', help='gradient clipping for Max gradient norm.', required=False, default=1.0,
-                        type=float)
-    parser.add_argument('--gradient_accumulation_steps',
-                        type=int,
-                        default=1,
-                        help="Number of updates steps to accumulate before performing a backward/update pass.")
+
     args = parser.parse_args()
     if args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
-    with open(args.output_dir + 'args.pkl', 'wb') as f:
-        pickle.dump(args ,f)
     return args
 
 
 def main():
-    """
-    Part0: Initialization
-    """
     args = parse_args()
-    # Initialize the accelerator. We will let the accelerator handle device placement for us.
+    with open(BASE_PATH + 'za/args/args_self_play_rl.pkl', 'wb') as f:
+        pickle.dump(args, f)
+    # exit()
+    # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     accelerator = Accelerator()
     device = accelerator.device
     logger.info(accelerator.state)
@@ -251,24 +187,38 @@ def main():
     datasets.utils.logging.set_verbosity(log_level)
     transformers.utils.logging.set_verbosity(log_level)
     transformers.utils.logging.enable_default_handler()
-    """
-    Part1: Prepare model
-    """
+    # selector
+    with open(BASE_PATH + 'za/args/args_self_play.pkl', 'rb') as f:
+        args_sel = pickle.load(f)
+        args_sel.model_name_or_path = args.sel_path
+    sel = Selector(args_sel, device)
+    # wizard
     with open(BASE_PATH + 'za/args/args_doha_train.pkl', 'rb') as f:
         args_wiz = pickle.load(f)
-        args_wiz.learning_rate = args.learning_rate
         args_wiz.experiment_type = 'chat_document'
         args_wiz.model_file_path = args.wiz_path
-        args_wiz.model_name = args.wiz_model_name
     wiz = MultiBartQA(args_wiz, device)
     # apprentice
     with open(BASE_PATH + 'za/args/args_bart_train.pkl', 'rb') as f:
         args_app = pickle.load(f)
         args_app.experiment_type = 'chat_document'
         args_app.model_file_path = args.app_path
-        args_app.model_name = args.app_model_name
     app = BartQA(args_app, device)
-    wiz, app = accelerator.prepare(wiz, app)
+    # Optimizer
+    # Split weights in two groups, one with weight decay and the other not.
+    no_decay = ["bias", "LayerNorm.weight"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in sel.selector.named_parameters() if not any(nd in n for nd in no_decay)],
+            "weight_decay": args.weight_decay,
+        },
+        {
+            "params": [p for n, p in sel.selector.named_parameters() if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+        },
+    ]
+    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    wiz, app, sel, optimizer = accelerator.prepare(wiz, app, sel, optimizer)
     # coverage scorers
     scorer_cov = CoverageScorer()
     # coherence scorer
@@ -278,44 +228,35 @@ def main():
     scorer_coh = CoherenceScorer(args_coh, accelerator.device)
     scorers = [scorer_cov, scorer_coh]
     alphas = [args.alpha_cov, args.alpha_coh]
-    trainer = RLTrainerForGenerator(args, wiz, app, scorers, alphas, accelerator)
-    """
-    Part2: Prepare data
-    """
-    assert args.train_file_rl is not None or args.validation_file_rl is not None
-    data_files_rl = {}
-    if args.train_file_rl is not None:
-        data_files_rl["train"] = args.train_file_rl
-    if args.validation_file_rl is not None:
-        data_files_rl["validation"] = args.validation_file_rl
-    extension = args.train_file_rl.split(".")[-1]
-    raw_datasets_rl = load_dataset(extension, data_files=data_files_rl, field='data')
+    if args.selector_type == 'post-conv':
+        trainer = RLTrainerForPostSelectorConv(args, wiz, app, sel, scorers, alphas, optimizer, accelerator)
+    elif args.selector_type == 'pre-conv':
+        trainer = RLTrainerForPreSelectorConv(args, wiz, app, sel, scorers, alphas, optimizer, accelerator)
+    elif args.selector_type == 'pre-uttr':
+        trainer = RLTrainerForSelectorUttr(args, wiz, app, sel, scorers, alphas, optimizer, accelerator)
+    else:
+        raise NotImplementedError
+    assert args.train_file is not None or args.validation_file is not None
+    data_files = {}
+    if args.train_file is not None:
+        data_files["train"] = args.train_file
+    if args.validation_file is not None:
+        data_files["validation"] = args.validation_file
+    extension = args.train_file.split(".")[-1]
+    raw_datasets = load_dataset(extension, data_files=data_files, field='data')
     if args.train_size is not None:
-        train_dataset_rl = raw_datasets_rl['train'].select(range(args.train_size))
+        train_dataset = raw_datasets['train'].select(range(args.train_size))
     else:
-        train_dataset_rl = raw_datasets_rl['train']
+        train_dataset = raw_datasets['train']
     if args.eval_size is not None:
-        eval_dataset_rl = raw_datasets_rl['validation'].select(range(args.eval_size))
+        eval_dataset = raw_datasets['validation'].select(range(args.eval_size))
     else:
-        eval_dataset_rl = raw_datasets_rl['validation']
-    assert args.cached_train_file_mle is not None
-    if os.path.exists(args.cached_train_file_mle):
-        train_dataset_mle = torch.load(args.cached_train_file_mle)
-    else:
-        train_dataset_mle = None
-    """
-    Part3: Start fine-tuning
-    """
-    trainer.finetune(train_dataset_rl, eval_dataset_rl, train_dataset_mle)
+        eval_dataset = raw_datasets['validation']
+
+    trainer.train_self_play_rl(train_dataset, eval_dataset)
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
 
 

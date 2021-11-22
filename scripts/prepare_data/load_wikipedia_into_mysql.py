@@ -19,10 +19,10 @@ CREATE TABLE `wikipedia`.`passages` (
 '''
 
 
-path_in = '/path/to/psgs_w100.tsv'
+path_in = '../Talk_/data/wikipedia-raw/psgs_w100.tsv'
 
 
-mydb = mysql.connector.connect(user='root', password='root1111',
+mydb = mysql.connector.connect(user='root', password='19911017',
                               host='127.0.0.1', database='wikipedia',
                               auth_plugin='mysql_native_password')
 mycursor = mydb.cursor()

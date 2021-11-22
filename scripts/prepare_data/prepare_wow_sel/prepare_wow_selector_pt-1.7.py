@@ -4,12 +4,14 @@ from utils.mysql_utils import get_passage
 from collections import defaultdict
 import json
 from rouge_score import rouge_scorer
+from tqdm import tqdm
 
-# version 1.6 selector data
+# version 1.7 selector pre-train data
 # conversation history in reverse order
 # Remove complex document
 # only use history and cur sentence
 # only use later sentence in the conversation as negative response
+# only use references in database, select sentences from 6 candicates
 
 dtype = 'train'
 # ['train', 'dev', test_random_split.json]
@@ -22,7 +24,7 @@ errors = []
 instances = []
 idx_dialog2_idx_ins = defaultdict(list)
 scorer = rouge_scorer.RougeScorer(['rouge2'])
-rouge_thresh = 0.7
+rouge_thresh = 0.6
 
 
 def select_candidate_references(references, label, num_candidates=4):
@@ -36,7 +38,9 @@ def select_candidate_references(references, label, num_candidates=4):
             return references[label-num_candidates+1: label+1], num_candidates-1
 
 
+progress_bar = tqdm(range(len(con)))
 for i, rec in enumerate(con):
+    progress_bar.update(1)
     # ['question', 'answers', 'target', 'ctxs']
     dialog = rec['dialog']
     # topic = rec['chosen_topic']
@@ -61,21 +65,15 @@ for i, rec in enumerate(con):
                     cate = info[0]
                     checked_sent = list(utterance['checked_sentence'].values())[0]
                     reference_title = ' '.join(info[1:-1])
-                    # if the reference passage is recorded, use it directly
-                    if reference_title in all_refs:
-                        references = all_refs[reference_title]
-                    # else search for it in Wikipedia database
+                    passage = get_passage(reference_title)
+                    if passage is None:
+                        references = None
                     else:
-                        passage = get_passage(reference_title)
-                        if passage is None:
+                        try:
+                            references = sent_tokenize(passage)[:8]
+                        except:
+                            errors.append(('%s-%s' % (i, j)))
                             references = None
-                        else:
-                            try:
-                                passage_ = sent_tokenize(passage)[:6]
-                                references = passage_
-                            except:
-                                errors.append(('%s-%s' % (i, j)))
-                                references = None
                 if references is not None:
                     # We need to make sure the checked sent is in the reference
                     ref2rouge = {}
@@ -84,30 +82,39 @@ for i, rec in enumerate(con):
                     sorted_ref2rouge = sorted(ref2rouge.items(), key=lambda kv: kv[1], reverse=True)
                     idx_ref, score = sorted_ref2rouge[0]
                     # If the checked sent is in the reference
-                    if score >= rouge_thresh and len(references) > 3:
+                    if score >= rouge_thresh and len(references) >= 6:
                         history_now = history_all.copy()
                         history_now.reverse()
                         # context_wiz = reference_title + ' \n ' + ' \n '.join(history_now)
-                        context_wiz = '</s>'.join(history_now)
+                        context_wiz = ' \\ '.join(history_now)
                         idx_dialog2_idx_ins[i].append(len(instances))
-                        references_, label = select_candidate_references(references, idx_ref, 4)
+                        references_, label = select_candidate_references(references, idx_ref, 6)
                         instance = {
                             'context': context_wiz,
                             'doc': references_,
                             'labels': label,
-                            'response': text
+                            'response': text,
+                            'checked_sent': checked_sent
                         }
                         instances.append(instance)
         history_all.append(text.replace('\n', '').replace('#', ''))
 
 
-out_path = '../Talk_/data/WoW-selector-1.6/'
+out_path = '../Talk_/data/WoW-selector-1.7/'
 if not os.path.exists(out_path):
     os.mkdir(out_path)
 with open(out_path + dtype + '.json', 'w') as f:
     dataset = {
-        'version': 1.6,
+        'version': 1.7,
         'data': instances
     }
     json.dump(dataset, f)
 
+print('Num instances in %s set - Raw:\t%s' % (dtype, len(con)))
+print('Num instances in %s set - Processed:\t%s' % (dtype, len(instances)))
+
+# Num instances in train set - Raw:	18430
+# Num instances in train set - Processed:	60784
+
+# Num instances in dev set - Raw:	981
+# Num instances in dev set - Processed:	3232

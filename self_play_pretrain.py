@@ -148,12 +148,12 @@ def parse_args():
     )
     parser.add_argument(
         "--do_pretrain",
-        default=True,
+        default=False,
         help="Flag for pre-train"
     )
     parser.add_argument(
         "--do_finetune",
-        default=False,
+        default=True,
         help="Flag for fine-tune"
     )
     parser.add_argument(
@@ -251,11 +251,13 @@ def main():
     selector.resize_token_embeddings(len(tokenizer))
     padding = "max_length" if args.pad_to_max_length else False
 
+
     def preprocess_function(examples):
         # choose four sentence out of all sentences
         # here, the first sentence is the reference sentence, the second sentence is the conversation history
         references = examples['doc']
-        history = [[context] * 4 for context in examples['context']]
+        num_refs = len(references[0])
+        history = [[context] * num_refs  for context in examples['context']]
         labels = examples['labels']
         # Flatten out
         first_sentences = sum(references, [])
@@ -269,12 +271,12 @@ def main():
             truncation=True,
         )
         # Un-flatten
-        tokenized_inputs = {k: [v[i: i + 4] for i in range(0, len(v), 4)] for k, v in tokenized_examples.items()}
+        tokenized_inputs = {k: [v[i: i + num_refs ] for i in range(0, len(v), num_refs )] for k, v in tokenized_examples.items()}
         tokenized_inputs["labels"] = labels
         return tokenized_inputs
 
-    remove_columns = [col_name for col_name in raw_datasets["train"].column_names if col_name != 'labels']
 
+    remove_columns = [col_name for col_name in raw_datasets["train"].column_names if col_name != 'labels']
     # Build train dataset
     processed_datasets = raw_datasets.map(
         preprocess_function, batched=True, remove_columns=remove_columns

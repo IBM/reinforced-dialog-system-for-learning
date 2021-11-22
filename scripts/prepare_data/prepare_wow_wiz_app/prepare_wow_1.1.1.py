@@ -7,18 +7,19 @@ from utils.mysql_utils import get_passage
 import os
 from pathlib import Path
 
-# version 1.1 conversation history in reverse order
+# version 1.1.1 conversation history in reverse order
 # Also remove speaker in the conversation history
+# Keep 10 turns of dialogue history
 
 '''
 Generate train and dev data
 '''
 
-dtype = 'train'
+dtype = 'dev'
 # ['train', 'dev']
 PATH_IN = '../Talk_/data/WoW-raw/%s.json' % dtype
 rouge = Rouge()
-chat_hist_len = 3
+chat_hist_len = 10
 
 with open(PATH_IN) as f:
     con = json.load(f)
@@ -54,11 +55,13 @@ for i, rec in enumerate(con):
         text = utterance['text']
         if speaker == 'Apprentice':
             history_last = history_all[-1*chat_hist_len: ]
-            history_last.reverse()
-            source_app = '</s>'.join(history_last)
-            source_list_app.append(source_app)
-            target_list_app.append(text)
-            doc_list_app.append('None')
+            # app only need to respond when wiz says first
+            if history_last != []:
+                history_last.reverse()
+                source_app = ' / '.join(history_last)
+                source_list_app.append(source_app)
+                target_list_app.append(text)
+                doc_list_app.append('None')
         else:
             assert speaker == 'Wizard'
             if 'checked_sentence' in utterance:
@@ -89,15 +92,15 @@ for i, rec in enumerate(con):
                 if reference is not None:
                     history_last = history_all[-1 * chat_hist_len:]
                     history_last.reverse()
-                    source_wiz = reference_title + '</s>' + '</s>'.join(history_last)
+                    source_wiz = reference_title + '. ' + ' / '.join(history_last)
                     source_list_wiz.append(source_wiz)
                     target_list_wiz.append(text)
                     doc_list_wiz.append(' '.join(reference))
         # history_all.append(text.replace('\n', ''))
-        history_all.append(text.replace('\n', ''))
+        history_all.append(text.replace('\n', '').replace('/', ' '))
 
 
-out_path_app = '../Talk_/data/WoW-processed/WoW-1.1/app'
+out_path_app = '../Talk_/data/WoW-processed/WoW-1.1.1/app'
 if not os.path.exists(out_path_app):
     Path(out_path_app).mkdir(parents=True, exist_ok=True)
 data_app = {
@@ -107,7 +110,7 @@ data_app = {
 }
 write_files(out_path_app, data_app, dtype)
 
-out_path_wiz = '../Talk_/data/WoW-processed/WoW-1.1/wiz'
+out_path_wiz = '../Talk_/data/WoW-processed/WoW-1.1.1/wiz'
 if not os.path.exists(out_path_wiz):
     Path(out_path_wiz).mkdir(parents=True, exist_ok=True)
 data_wiz = {
@@ -116,42 +119,4 @@ data_wiz = {
     'docs': doc_list_wiz
 }
 write_files(out_path_wiz, data_wiz, dtype)
-
-
-# '''
-# Generate test data
-# '''
-# PATH_IN = '../Talk_/data/WoW-raw/train.json'
-# with open(PATH_IN) as f:
-#     con_train = json.load(f)
-# themes_trained = {}
-# for rec in con_train:
-#     themes_trained[rec['chosen_topic']] = None
-#
-# PATH_IN = '../Talk_/data/WoW-raw/test.json'
-# with open(PATH_IN) as f:
-#     con_test = json.load(f)
-#
-# outputs_themes_overlap = []
-# outputs_themes_nonoverlap = []
-# for rec in con_test:
-#     theme = rec['chosen_topic']
-#     for dialog in rec['dialog']:
-#         if 'retrieved_passages' in dialog:
-#             assert len(dialog['retrieved_passages']) > 0
-#             topic, paras = list(dialog['retrieved_passages'][0].items())[0]
-#             passage = ' '.join(paras)
-#             if topic in themes_trained:
-#                 outputs_themes_overlap.append((topic, passage))
-#             else:
-#                 outputs_themes_nonoverlap.append((topic, passage))
-#             break
-#
-# import json
-# with open('./data/WoW-1.1/test_overlap.json', 'w') as f:
-#     json.dump(outputs_themes_overlap, f)
-# with open('./data/WoW-1.1/test_nonoverlap.json', 'w') as f:
-#     json.dump(outputs_themes_nonoverlap, f)
-
-
 

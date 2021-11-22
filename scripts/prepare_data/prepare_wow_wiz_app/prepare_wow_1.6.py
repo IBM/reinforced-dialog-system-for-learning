@@ -17,9 +17,10 @@ from pathlib import Path
 Generate train and dev data
 '''
 
-dtype = 'train'
+dtype = 'dev'
 # ['train', 'dev']
 PATH_IN = '../Talk_/data/WoW-raw/%s.json' % dtype
+# scorer = rouge_scorer.RougeScorer(['rouge2'], use_stemmer=True)
 rouge = Rouge()
 chat_hist_len = 3
 rouge_thresh = 0.7
@@ -96,6 +97,7 @@ for i, rec in enumerate(con):
                     # We need to make sure the checked sent is in the reference
                     ref2rouge = {}
                     for k, reference in enumerate(references):
+                        # ref2rouge[k] = scorer.score(checked_sent, reference)['rouge2'].precision
                         ref2rouge[k] = rouge.get_scores(checked_sent, reference)[0]['rouge-2']['p']
                     sorted_ref2rouge = sorted(ref2rouge.items(), key=lambda kv: kv[1], reverse=True)
                     idx_ref, score = sorted_ref2rouge[0]
@@ -110,7 +112,7 @@ for i, rec in enumerate(con):
         history_all.append(text.replace('\n', ''))
 
 
-out_path_app = './data/WoW-%s/app' % version
+out_path_app = '../Talk_/data/WoW-processed/WoW-%s/app' % version
 if not os.path.exists(out_path_app):
     Path(out_path_app).mkdir(parents=True, exist_ok=True)
 data_app = {
@@ -120,7 +122,7 @@ data_app = {
 }
 write_files(out_path_app, data_app, dtype)
 
-out_path_wiz = './data/WoW-%s/wiz' % version
+out_path_wiz = '../Talk_/data/WoW-processed/WoW-%s/wiz' % version
 if not os.path.exists(out_path_wiz):
     Path(out_path_wiz).mkdir(parents=True, exist_ok=True)
 data_wiz = {
@@ -130,41 +132,41 @@ data_wiz = {
 }
 write_files(out_path_wiz, data_wiz, dtype)
 
-
-'''
-Generate test data
-'''
-PATH_IN = '../Talk_/data/WoW-raw/train.json'
-with open(PATH_IN) as f:
-    con_train = json.load(f)
-themes_trained = {}
-for rec in con_train:
-    themes_trained[rec['chosen_topic']] = None
-
-PATH_IN = '../Talk_/data/WoW-raw/test.json'
-with open(PATH_IN) as f:
-    con_test = json.load(f)
-
-outputs_themes_overlap = []
-outputs_themes_nonoverlap = []
-for rec in con_test:
-    theme = rec['chosen_topic']
-    for dialog in rec['dialog']:
-        if 'retrieved_passages' in dialog:
-            assert len(dialog['retrieved_passages']) > 0
-            topic, paras = list(dialog['retrieved_passages'][0].items())[0]
-            passage = ' '.join(paras)
-            if topic in themes_trained:
-                outputs_themes_overlap.append((topic, passage))
-            else:
-                outputs_themes_nonoverlap.append((topic, passage))
-            break
-
-import json
-with open('../Talk_/data/WoW-%s/test_overlap.json' % version, 'w') as f:
-    json.dump(outputs_themes_overlap, f)
-with open('../Talk_/data/WoW-%s/test_nonoverlap.json' % version, 'w') as f:
-    json.dump(outputs_themes_nonoverlap, f)
+#
+# '''
+# Generate test data
+# '''
+# PATH_IN = '../Talk_/data/WoW-raw/train.json'
+# with open(PATH_IN) as f:
+#     con_train = json.load(f)
+# themes_trained = {}
+# for rec in con_train:
+#     themes_trained[rec['chosen_topic']] = None
+#
+# PATH_IN = '../Talk_/data/WoW-raw/test.json'
+# with open(PATH_IN) as f:
+#     con_test = json.load(f)
+#
+# outputs_themes_overlap = []
+# outputs_themes_nonoverlap = []
+# for rec in con_test:
+#     theme = rec['chosen_topic']
+#     for dialog in rec['dialog']:
+#         if 'retrieved_passages' in dialog:
+#             assert len(dialog['retrieved_passages']) > 0
+#             topic, paras = list(dialog['retrieved_passages'][0].items())[0]
+#             passage = ' '.join(paras)
+#             if topic in themes_trained:
+#                 outputs_themes_overlap.append((topic, passage))
+#             else:
+#                 outputs_themes_nonoverlap.append((topic, passage))
+#             break
+#
+# import json
+# with open('../Talk_/data/WoW-%s/test_overlap.json' % version, 'w') as f:
+#     json.dump(outputs_themes_overlap, f)
+# with open('../Talk_/data/WoW-%s/test_nonoverlap.json' % version, 'w') as f:
+#     json.dump(outputs_themes_nonoverlap, f)
 
 
 
