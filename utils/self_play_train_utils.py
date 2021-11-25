@@ -470,7 +470,7 @@ class RLTrainerForGenerator:
                                                         temperature=1.0,
                                                         top_k=50,
                                                         top_p=0.9,
-                                                        num_return_sequences=1
+                                                        num_return_sequences=1,
                                                         )
         responses_all = self.wiz.tokenizer.batch_decode(predicted_ids, skip_special_tokens=True)
         return responses_all
@@ -782,9 +782,9 @@ class RLTrainerForGenerator:
             progress_bar_train.update(1)
             if step % self.args.eval_steps == 0 and step > 0:
                 self.log('--- Eval epoch %s starts ---' % eval_epoch)
-                eval_epoch += 1
                 self.evaluate(eval_dataloader_rl)
                 self.log('--- Eval epoch %s ends ---' % eval_epoch)
+                eval_epoch += 1
             if step % self.args.save_steps == 0 and step > 0:
                 self.wiz.generator.save_pretrained(self.args.output_dir + 'step_%s' % step)
             if step >= self.args.max_train_steps:

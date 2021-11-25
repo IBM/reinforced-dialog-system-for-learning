@@ -213,6 +213,11 @@ def parse_args():
         default=5
     )
     parser.add_argument(
+        "--max_length",
+        type=int,
+        default=5
+    )
+    parser.add_argument(
         "--max_cov_score",
         type=float,
         default=0.5
