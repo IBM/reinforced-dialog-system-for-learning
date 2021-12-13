@@ -1,7 +1,7 @@
 import re
 import matplotlib.pyplot as plt
 
-version = '1.7.1'
+version = '1.6.10'
 path_in = '../Talk_/logs/self_play_rl_%s.txt' % version
 with open(path_in) as f:
     con = f.read()
@@ -22,5 +22,8 @@ plt.title(version)
 plt.legend()
 plt.show()
 
+# ps3: 1.7.5
+# ps6: 1.7.5.1
+# gypsum 1.7.5.2
 
 

@@ -1,6 +1,7 @@
 import numpy as np
+import torch
 import torch.nn.functional as F
-from transformers import GPT2LMHeadModel, GPT2Tokenizer, AutoModelForSequenceClassification
+from transformers import GPT2LMHeadModel, GPT2Tokenizer, AutoModelForSequenceClassification, AutoModel
 from rouge_score import rouge_scorer
 from utils.self_play_model_utils import *
 import math
@@ -65,13 +66,13 @@ class CoverageScorer:
             assert type(history) is str
             history_ = history
         scores = self.scorer.score(document, history_)
-        return scores['rouge2'].fmeasure
+        return scores['rouge1'].fmeasure
 
     def score_utterance(self, histories, documents):
         if type(histories) is str:
             # score one instance
             scores = self.scorer.score(documents, histories)
-            return scores['rouge2'].fmeasure
+            return scores['rouge1'].fmeasure
         else:
             # score a batch
             assert type(histories) == list
@@ -128,7 +129,7 @@ class CoherenceScorer:
             from_tf=bool(".ckpt" in args.model_name_or_path),
             config=config,
         )
-        self.model.load_state_dict(torch.load(args.model_name_or_path))
+        self.model.load_state_dict(torch.load(args.model_name_or_path, map_location=device))
         if device is not None:
             self.device = device
         else:
@@ -202,6 +203,85 @@ class CoherenceScorer:
             coh_scores.append(np.mean(coh_scores_conv))
         return coh_scores
 
+
+class CoherenceScorerWoW:
+    def __init__(self, args, device=None):
+        base_model = 'bert-base-cased'
+        self.args = args
+        config = AutoConfig.from_pretrained(base_model)
+        self.tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=not args.use_slow_tokenizer)
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            base_model,
+            from_tf=False,
+            config=config,
+        )
+        self.model.load_state_dict(torch.load(args.model_name_or_path, map_location=device))
+
+        if device is not None:
+            self.device = device
+        else:
+            self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.model.eval()
+        self.model.to(device)
+
+    def predict(self, premise, hypothesis):
+        inputs = self.tokenizer(premise, hypothesis, return_tensors='pt').to(self.device)
+        with torch.no_grad():
+            outputs = self.model(**inputs)[0].cpu()
+        return torch.softmax(outputs[0], dim=0).numpy()[1]
+
+    # def score_conversation(self, history, full_score=0.3):
+    #     idxs_app = [2 * i + 1 for i in range(math.ceil(len(history) / 2 - 1))]
+    #     score_per_turn = full_score / len(idxs_app)
+    #     coh_score = 0
+    #     for idx in idxs_app:
+    #         premise = history[idx]
+    #         hypothesis = history[idx + 1]
+    #         pred = self.predict(premise.lower(), hypothesis.lower())
+    #         if pred == 0:
+    #             coh_score += score_per_turn
+    #         elif pred == 1:
+    #             coh_score += score_per_turn * 0.2
+    #         else:
+    #             assert pred == 2
+    #             # do nothing
+    #     return coh_score
+
+    def score_utterance(self, premises, hypothesises):
+        if type(premises) == str:
+            # score one instance
+            with torch.no_grad():
+                coh_score = self.predict(premises.lower(), hypothesises.lower())
+            return coh_score
+        else:
+            # score a batch
+            assert type(premises) == list
+            assert type(hypothesises) == list
+            coh_scores = []
+            for premise, hypothesis in zip(premises, hypothesises):
+                coh_scores.append(self.score_utterance(premise, hypothesis))
+            return coh_scores
+
+    def score_utterance_for_generator(self, responses, histories):
+        coh_scores = []
+        assert len(responses) == len(histories)
+        last_utterances = [history.split(' / ')[0] for history in histories]
+        for premise, hypothesis in zip(last_utterances, responses):
+            coh_scores.append(self.score_utterance(premise, hypothesis))
+        return np.array(coh_scores)
+
+    def score_conversation_for_generator(self, histories):
+        coh_scores = []
+        histories_ = [history.split(' / ') for history in histories]
+        for history in histories_:
+            history.reverse()
+            coh_scores_conv = []
+            for i in range(int(len(history) / 2)):
+                uttr_app = history[i+1]
+                uttr_wiz = history[i+2]
+                coh_scores_conv.append(self.score_utterance(uttr_app, uttr_wiz))
+            coh_scores.append(np.mean(coh_scores_conv))
+        return coh_scores
 
 
 

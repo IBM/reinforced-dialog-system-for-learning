@@ -1,11 +1,11 @@
-import math
-import random
 from datetime import datetime
-import numpy as np
-import torch
 from nltk import sent_tokenize
 from utils.reward_utils import *
 from torch.distributions import Categorical
+import numpy as np
+import torch
+import math
+import random
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.multiprocessing as mp
@@ -20,7 +20,7 @@ class RLTrainerForSelector:
         self.app = app
         self.sel = sel
         assert len(scorers) == len(alphas)
-        assert sum(alphas) == 1.0
+        # assert sum(alphas) == 1.0
         self.scorers = scorers
         self.alphas = alphas
         self.optimizer = optimizer
@@ -691,14 +691,7 @@ class RLTrainerForGenerator:
                                                                       do_sample=False)
         sample_responses, RL_log_probs = self.generate_wiz_response_finetune(source_ids, doc_ids, source_mask, doc_mask,
                                                                              do_sample=True)
-        # except:
-        #     info = {
-        #         'source_ids': source_ids,
-        #         'doc_ids': doc_ids,
-        #         'source_mask': source_mask,
-        #         'doc_mask': doc_mask
-        #     }
-        #     torch.save(info, '../Talk_/za/info.pt')
+
         sample_scores, (sample_cov_scores, sample_coh_scores) = self.get_reward_score(sample_responses, histories,
                                                                                       documents)
         greedy_scores, (greedy_cov_scores, greedy_coh_scores) = self.get_reward_score(greedy_responses, histories,
@@ -862,5 +855,4 @@ class RLTrainerForGenerator:
             documents = ['None' for _ in source]
         documents_ = ['chat: %s document: %s' % (s, d) for s, d in zip(source, documents)]
         return documents_
-
 

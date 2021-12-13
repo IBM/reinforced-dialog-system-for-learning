@@ -18,6 +18,7 @@ import logging as logging_
 import math
 import os
 import random
+import time
 
 import datasets
 from datasets import load_dataset, load_metric
@@ -145,6 +146,9 @@ def parse_args():
         "--num_warmup_steps", type=int, default=0, help="Number of steps for the warmup in the lr scheduler."
     )
     parser.add_argument(
+        "--label_list", type=str, default=None
+    )
+    parser.add_argument(
         "--wow_weight", type=float, default=0.1, help="The weight for WoW instance"
     )
     parser.add_argument("--output_dir", type=str, default=None, help="Where to store the final model.")
@@ -238,7 +242,10 @@ def main():
         is_regression = args.task_name == "stsb"
         if not is_regression:
             # label_list = raw_datasets["train"].features["label"].names
-            label_list = ['entailment', 'neutral', 'contradiction']
+            if args.label_list is None:
+                label_list = ['entailment', 'neutral', 'contradiction']
+            else:
+                label_list = args.label_list.split('-')
             num_labels = len(label_list)
         else:
             num_labels = 1
@@ -253,6 +260,10 @@ def main():
             label_list = raw_datasets["train"].unique("label")
             label_list.sort()  # Let's sort it for determinism
             num_labels = len(label_list)
+
+    print('Num of Labels: %s' % num_labels)
+    print('Label List: %s' % label_list)
+    time.sleep(15)
 
     # Load pretrained model and tokenizer
     #

@@ -222,6 +222,11 @@ def parse_args():
         type=float,
         default=0.5
     )
+    parser.add_argument(
+        "--coh_model",
+        type=str,
+        default='infersent'
+    )
     parser.add_argument('--max_grad_norm', help='gradient clipping for Max gradient norm.', required=False, default=1.0,
                         type=float)
     parser.add_argument('--gradient_accumulation_steps',
@@ -259,6 +264,7 @@ def main():
     """
     Part1: Prepare model
     """
+    # wizard
     with open(BASE_PATH + 'za/args/args_doha_train.pkl', 'rb') as f:
         args_wiz = pickle.load(f)
         args_wiz.learning_rate = args.learning_rate
@@ -277,10 +283,17 @@ def main():
     # coverage scorers
     scorer_cov = CoverageScorer()
     # coherence scorer
-    with open(BASE_PATH + 'za/args/args_coh.pkl', 'rb') as f:
-        args_coh = pickle.load(f)
-        args_coh.model_name_or_path = args.coh_path
-    scorer_coh = CoherenceScorer(args_coh, accelerator.device)
+    if args.coh_model == 'infersent':
+        with open(BASE_PATH + 'za/args/args_coh_infersent.pkl', 'rb') as f:
+            args_coh = pickle.load(f)
+            args_coh.model_name_or_path = args.coh_path
+        scorer_coh = CoherenceScorer(args_coh, accelerator.device)
+    else:
+        assert args.coh_model == 'wow'
+        with open(BASE_PATH + 'za/args/args_coh_wow.pkl', 'rb') as f:
+            args_coh = pickle.load(f)
+            args_coh.model_name_or_path = args.coh_path
+        scorer_coh = CoherenceScorerWoW(args_coh, accelerator.device)
     scorers = [scorer_cov, scorer_coh]
     alphas = [args.alpha_cov, args.alpha_coh]
     trainer = RLTrainerForGenerator(args, wiz, app, scorers, alphas, accelerator)
@@ -316,9 +329,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
 
 
 

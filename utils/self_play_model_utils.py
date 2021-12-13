@@ -123,7 +123,7 @@ class BartQA:
             print('Loading exisitng model at ' + str(self.args.model_file_path))
             sys.stdout.flush()
             self.generator = BartForConditionalGeneration.from_pretrained(self.args.model_name, state_dict=
-            torch.load(self.args.model_file_path)['model'])
+            torch.load(self.args.model_file_path, map_location=self.device)['model'])
         else:
             print('Loading default pre-trained BART weights')
             sys.stdout.flush()
