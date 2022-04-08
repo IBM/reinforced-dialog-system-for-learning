@@ -626,7 +626,6 @@ class MultiBartQA:
         return text
 
     def generate(self):
-
         if self.args.experiment_type == 'chat_wizard':
             self.generate_wizard()
         else:

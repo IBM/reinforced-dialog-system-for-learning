@@ -1,5 +1,5 @@
 import datasets
-from datasets import load_dataset, load_metric
+from datasets import load_dataset
 from transformers import (
     MODEL_MAPPING
 )
@@ -7,7 +7,10 @@ from accelerate import Accelerator
 import pickle
 from utils.self_play_infra_utils import *
 from utils.self_play_train_utils import *
+from utils.self_play_model_utils import MultiBartQA, BartQA
+from utils.reward_utils import CoverageScorer, CoherenceScorer, CoherenceScorerWoW
 from consts import *
+import argparse
 
 logger = logging.get_logger(__name__)
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
@@ -237,7 +240,7 @@ def parse_args():
     if args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
     with open(args.output_dir + 'args.pkl', 'wb') as f:
-        pickle.dump(args ,f)
+        pickle.dump(args, f)
     return args
 
 

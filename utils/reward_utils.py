@@ -1,10 +1,15 @@
+import torch.nn.functional as F
 import numpy as np
 import torch
-import torch.nn.functional as F
-from transformers import GPT2LMHeadModel, GPT2Tokenizer, AutoModelForSequenceClassification, AutoModel
-from rouge_score import rouge_scorer
-from utils.self_play_model_utils import *
 import math
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    BartTokenizer,
+    GPT2LMHeadModel,
+    GPT2Tokenizer,
+    AutoModelForSequenceClassification
+)
 
 
 class LanguageModelScorer:
@@ -54,6 +59,7 @@ class LanguageModelScorer:
 
 class CoverageScorer:
     def __init__(self, max_cov_score=1.0):
+        from rouge_score import rouge_scorer
         self.scorer = rouge_scorer.RougeScorer(['rouge1'], use_stemmer=True)
         self.max_cov_score = max_cov_score
         self.tokenizer = BartTokenizer.from_pretrained('facebook/bart-base')
@@ -208,7 +214,7 @@ class CoherenceScorerWoW:
     def __init__(self, args, device=None):
         base_model = 'bert-base-cased'
         self.args = args
-        config = AutoConfig.from_pretrained(base_model)
+        config = AutoConfig.from_pretrained(base_model, num_label=2)
         self.tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=not args.use_slow_tokenizer)
         self.model = AutoModelForSequenceClassification.from_pretrained(
             base_model,

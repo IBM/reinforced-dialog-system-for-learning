@@ -30,8 +30,6 @@ from transformers.modeling_bart import (
 
 from transformers.file_utils import (
     add_code_sample_docstrings,
-    add_end_docstrings,
-    add_start_docstrings,
     add_start_docstrings_to_callable,
     replace_return_docstrings,
 )
@@ -82,6 +80,7 @@ class MHAAttention(Attention):
             self.cache_key = "self"
 
         #self.cache_key = "encoder_decoder" if self.encoder_decoder_attention else "self"
+
 
 class MHADecoderLayer(nn.Module):
     def __init__(self, config: BartConfig):

@@ -1,424 +1,16 @@
 from datetime import datetime
-from nltk import sent_tokenize
-from utils.reward_utils import *
+import torch.nn.functional as F
 from torch.distributions import Categorical
 import numpy as np
 import torch
 import math
 import random
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.multiprocessing as mp
-import torch.distributed as dist
-from transformers.generation_utils import top_k_top_p_filtering
-
-
-class RLTrainerForSelector:
-    def __init__(self, args, wiz, app, sel, scorers, alphas, optimizer, accelerator):
-        self.args = args
-        self.wiz = wiz
-        self.app = app
-        self.sel = sel
-        assert len(scorers) == len(alphas)
-        # assert sum(alphas) == 1.0
-        self.scorers = scorers
-        self.alphas = alphas
-        self.optimizer = optimizer
-        self.accelerator = accelerator
-        self.wiz.generator.eval()
-        self.app.generator.eval()
-        self.scorer_c = CoverageScorer(max_cov_score=args.max_cov_score)
-        if not args.log_dir.endswith('.txt'):
-            self.log_dir = args.log_dir + '/log.txt'
-        else:
-            self.log_dir = args.log_dir
-        with open(self.log_dir, 'w') as f:
-            f.write('***** Running RL Fine-tuning *****\n')
-        self.start_time = datetime.now()
-        if not os.path.exists(self.args.output_dir):
-            os.mkdir(self.args.output_dir)
-
-    def log(self, content):
-        with open(self.log_dir, 'a') as f:
-            f.write(content.strip() + '\n')
-        print(content.strip() + '\n')
-
-    def tokenize_doc(self, documents):
-        if type(documents) == str:
-            references = sent_tokenize(documents)
-        else:
-            assert type(documents) == list
-            references = [sent_tokenize(document) for document in documents]
-        return references
-
-
-class RLTrainerForSelectorConv(RLTrainerForSelector):
-    '''
-    The reward is back propagated after each conversation is finished
-    '''
-
-    def __init__(self, args, wiz, app, sel, scorers, alphas, optimizer, accelerator):
-        super().__init__(args, wiz, app, sel, scorers, alphas, optimizer, accelerator)
-
-    def get_reward_score(self, history, document):
-        scores = {}
-        for scorer, alpha in zip(self.scorers, self.alphas):
-            if type(scorer) is CoverageScorer:
-                score_cov = scorer.score_conversation(history, document)
-                scores['cov'] = alpha * score_cov
-            elif type(scorer) is CoherenceScorer:
-                score_coh = scorer.score_conversation(history)
-                scores['coh'] = alpha * score_coh
-            else:
-                raise NotImplementedError
-        return sum(scores.values()), scores
-
-    def make_conversation(self, topic, document, reverse=True, greedy=False):
-        raise NotImplementedError
-
-    def train_self_play_rl_step(self, idx, topics, documents):
-        ins_start_time = datetime.now()
-        # sampling
-        sample_histories, RL_log_probs = self.make_conversation(topics, documents, reverse=self.args.reverse,
-                                                                greedy=False)
-        with torch.autograd.no_grad():
-            # greedy baseline
-            greedy_histories, _ = self.make_conversation(topics, documents, reverse=self.args.reverse, greedy=True)
-        sample_rewards_batch, sample_scores_batch = self.get_reward_score(sample_histories, documents)
-        baseline_rewards_batch, greedy_scores_batch = self.get_reward_score(greedy_histories, documents)
-        rl_loss = -(sample_rewards_batch - baseline_rewards_batch) * RL_log_probs
-        self.log('\n### Training step %s ###' % idx +
-                 '\nSample conversation:\t%s\nSample reward:\tCoverage - %f\tCoherence - %f' % (
-                     '</s>'.join(sample_histories), sample_scores_batch['cov'], sample_scores_batch['coh']) +
-                 '\nBaseline conversation\t%s\nBaseline reward:\tCoverage - %f\tCoherence - %f' % (
-                     '</s>'.join(greedy_histories), greedy_scores_batch['cov'], greedy_scores_batch['coh']) +
-                 '\nCoverage difference: %f\tCoherence difference: %f' %
-                 (sample_scores_batch['cov'] - greedy_scores_batch['cov'],
-                  sample_scores_batch['coh'] - greedy_scores_batch['coh'])
-                 )
-        ins_end_time = datetime.now()
-        self.log('Per instance time: %s\tTotal time consumed: %s' % (
-            str(ins_end_time - ins_start_time), str(ins_end_time - self.start_time)))
-        # Self-critic policy gradient training (eq 15 in https://arxiv.org/pdf/1705.04304.pdf)
-        # rl_loss = torch.mean(rl_loss)
-        # batch_reward = torch.mean(sample_reward).item()
-        self.optimizer.zero_grad()
-        # rl_loss.backward()
-        self.accelerator.backward(rl_loss)
-        self.optimizer.step()
-
-    def train_self_play_rl(self, train_dataset, eval_dataset):
-        # Only show the progress bar once on each machine.
-        progress_bar_train = tqdm(range(int(self.args.max_train_steps / self.args.batch_size)))
-        completed_steps = 0
-        eval_epoch = 0
-        self.sel.selector.train()
-        num_steps = math.floor(len(train_dataset) / self.args.batch_size)
-        indexes = list(range(len(train_dataset)))
-        if self.args.shuffle:
-            random.shuffle(indexes)
-        for i in range(num_steps):
-            indexes_batch = indexes[i * self.args.batch_size: (i + 1) * self.args.batch_size]
-            instances = train_dataset[indexes_batch]
-            topics, documents = instances['topic'], instances['document']
-            try:
-                self.train_self_play_rl_step(i, topics, documents)
-            except:
-                self.log('Failed training case, idx %s' % i)
-                self.log('Topic:\t%s' % topics)
-                self.log('Document:\t%s' % documents)
-            progress_bar_train.update(1)
-            completed_steps += 1
-            if completed_steps % self.args.eval_steps == 0:
-                self.log('--- Eval epoch %s starts ---' % eval_epoch)
-                eval_epoch += 1
-                self.eval_self_play_rl(eval_dataset)
-            if completed_steps % self.args.save_steps == 0:
-                self.sel.save_model(self.args.output_dir, '/step_%s' % i)
-            if completed_steps >= self.args.max_train_steps:
-                break
-
-    def eval_self_play_rl(self, dataset):
-        eval_start_time = datetime.now()
-        progress_bar_eval = tqdm(range(len(dataset)))
-        self.sel.selector.eval()
-        all_scores_cov = []
-        all_scores_coh = []
-        for j, instance in enumerate(dataset):
-            topic, document = instance['topic'], instance['document']
-            try:
-                with torch.autograd.no_grad():
-                    history, _ = self.make_conversation(topic, document, reverse=self.args.reverse, greedy=True)
-                reward, scores = self.get_reward_score(history, document)
-                self.log('\n--- Eval step %s ---' % j +
-                         '\nConversation:\t%s\nReward:\t%f' % (
-                             '</s>'.join(history), reward))
-                all_scores_cov.append(scores['cov'])
-                all_scores_coh.append(scores['coh'])
-            except:
-                self.log('Failed eval case, idx %s' % j)
-                self.log('Topic:\t%s' % topic)
-                self.log('Document:\t%s' % document)
-            progress_bar_eval.update(1)
-        self.log('--- Eval average coverage score: %f ---' % (np.mean(all_scores_cov)))
-        self.log('--- Eval average coherence score: %f ---' % (np.mean(all_scores_coh)))
-        eval_end_time = datetime.now()
-        self.log('--- Eval time consumed: %s ---' % str(eval_end_time - eval_start_time))
-        self.sel.selector.train()
-
-
-class RLTrainerForPostSelectorConv(RLTrainerForSelectorConv):
-    def __init__(self, args, wiz, app, sel, scorers, alphas, optimizer, accelerator):
-        super().__init__(args, wiz, app, sel, scorers, alphas, optimizer, accelerator)
-
-    def make_conversation(self, topic, document, reverse=True, greedy=False):
-        history = ""
-        log_probs = []
-        for i in range(self.args.num_turns):
-            wiz_say_candidates = doha_generate(self.wiz, topic, history, document,
-                                               num_return_sequences=self.args.num_candicates)
-            probs = self.sel.select(wiz_say_candidates, history, document)
-            if not greedy:
-                multi_dist = Categorical(probs)
-                idx_candidate = multi_dist.sample()
-                log_prob = multi_dist.log_prob(idx_candidate)
-                log_probs.append(log_prob)
-            else:
-                idx_candidate = torch.argmax(probs)
-            wiz_say = wiz_say_candidates[idx_candidate]
-            history = update_history(history, wiz_say, reverse=reverse)
-            if i != self.args.num_turns - 1:  # the app do not need to response in the last turn
-                app_say = bart_generate(self.app, history, num_return_sequences=self.args.num_candicates)
-                history = update_history(history, app_say, reverse=reverse)
-        history = parse_conversation_history(history, reverse=reverse)
-        if not greedy:
-            log_probs = torch.stack(log_probs)
-            log_probs = torch.sum(log_probs)
-        return history, log_probs
-
-
-class RLTrainerForPreSelectorConv(RLTrainerForSelectorConv):
-    def __init__(self, args, wiz, app, sel, scorers, alphas, optimizer, accelerator):
-        super().__init__(args, wiz, app, sel, scorers, alphas, optimizer, accelerator)
-
-    def make_conversation_old(self, topic, document, reverse=True, greedy=False):
-        history = ""
-        log_probs = []
-        sents_doc = sent_tokenize(document)
-        for i in range(self.args.num_turns):
-            probs = self.sel.select(sents_doc, history, document)
-            if not greedy:
-                multi_dist = Categorical(probs)
-                idx_sent = multi_dist.sample()
-                while idx_sent == torch.argmax(probs) and len(sents_doc) > 1:
-                    idx_sent = multi_dist.sample()
-                log_prob = multi_dist.log_prob(idx_sent)
-                log_probs.append(log_prob)
-            else:
-                idx_sent = torch.argmax(probs)
-            wiz_say = doha_generate(self.wiz, topic, history, sents_doc[idx_sent], num_return_sequences=1)[0]
-            history = update_history(history, wiz_say, reverse=reverse)
-            if i != self.args.num_turns - 1:  # the app do not need to response in the last turn
-                app_say = bart_generate(self.app, history, num_return_sequences=self.args.num_candicates)
-                history = update_history(history, app_say, reverse=reverse)
-        history = parse_conversation_history(history, reverse=reverse)
-        if not greedy:
-            log_probs = torch.stack(log_probs)
-            log_probs = torch.sum(log_probs)
-        return history, log_probs
-
-    def make_conversation(self, topics, documents, reverse=True, greedy=False):
-        histories = ['' for _ in range(len(topics))]
-        references = self.tokenize_doc(documents)
-        log_probs = None
-        for i in range(self.args.num_turns):
-            probs_batch = self.sel.select(references, histories, documents)
-            if not greedy:
-                multi_dist = Categorical(probs_batch)
-                idx_sent = multi_dist.sample()
-                # force the sampler to select sth different from the baseline
-                # while idx_sent == torch.argmax(probs_batch) and len(references) > 1:
-                #     idx_sent = multi_dist.sample()
-                log_prob = multi_dist.log_prob(idx_sent)
-                log_probs.append(log_prob)
-            else:
-                idx_sent = torch.argmax(probs_batch)
-            sents = [references[i][idx_sent[i]] for i in range(len(idx_sent))]
-
-
-class RLTrainerForSelectorUttr(RLTrainerForSelector):
-    '''
-    The reward is back propagated after each conversation is finished
-    '''
-
-    def __init__(self, args, wiz, app, sel, scorers, alphas, optimizer, accelerator):
-        super().__init__(args, wiz, app, sel, scorers, alphas, optimizer, accelerator)
-
-    def make_utterance(self, topics, documents, histories, greedy):
-        references = self.tokenize_doc(documents)
-        probs_batch = self.sel.select(references, histories, documents)
-        log_probs = None
-        if not greedy:
-            multi_dist = Categorical(probs_batch)
-            idx_sent = multi_dist.sample()
-            # force the sampler to select sth different from the baseline
-            # while idx_sent == torch.argmax(probs_batch) and len(references) > 1:
-            #     idx_sent = multi_dist.sample()
-            log_probs = multi_dist.log_prob(idx_sent).to(self.sel.device)
-        else:
-            idx_sent = torch.argmax(probs_batch, dim=1)
-        sents = [references[i][idx_sent[i]] for i in range(len(idx_sent))]
-        wiz_say = doha_generate(self.wiz, topics, histories, sents, num_return_sequences=1)
-        return wiz_say, log_probs
-
-    def get_reward_score(self, documents, utterances, histories, reverse, get_coh):
-        if type(documents) == str:
-            # input is a single instance
-            scores = {}
-            for scorer, alpha in zip(self.scorers, self.alphas):
-                if type(scorer) is CoverageScorer:
-                    old_cov = scorer.score_utterance(histories, documents)
-                    now_cov = scorer.score_utterance(update_history(histories, utterances, reverse=reverse), documents)
-                    score_cov = now_cov - old_cov
-                    scores['cov'] = alpha * score_cov
-                elif type(scorer) is CoherenceScorer:
-                    if get_coh:
-                        score_coh = scorer.score_utterance(utterances, histories)
-                        scores['coh'] = alpha * score_coh
-                    else:
-                        scores['coh'] = 0.0
-                else:
-                    raise NotImplementedError
-            return sum(scores.values()), scores
-        else:
-            assert type(documents) == list
-            # input is a batch
-            rewards_batch, scores_batch = [], []
-            for document, utterance, history in zip(documents, utterances, histories):
-                reward, score = self.get_reward_score(document, utterance, history, reverse, get_coh)
-                rewards_batch.append(reward)
-                scores_batch.append(score)
-            return torch.from_numpy(np.array(rewards_batch)).to(self.sel.device), scores_batch
-
-    def log_step(self, histories, sample_utterances_batch, greedy_utterances_batch, sample_scores_batch,
-                 greedy_scores_batch):
-        for i, history in enumerate(histories):
-            log_str = 'Conversation %s\n' % i
-            history_ = parse_conversation_history(history, reverse=self.args.reverse)
-            wiz_positions = [2 * i for i in range(math.ceil(len(history_) / 2))]
-            app_positions = [2 * i + 1 for i in range(math.floor(len(history_) / 2))]
-            for j, idx in enumerate(wiz_positions):
-                log_str += '\tSample: %s\n' % sample_utterances_batch[j][i]
-                log_str += '\tGreedy: %s\n' % greedy_utterances_batch[j][i]
-                log_str += '\tSample Coverage Score: %s\tSample Coherence Score: %s\n' % (
-                    round(sample_scores_batch[j][i]['cov'], 3), sample_scores_batch[j][i]['coh'])
-                log_str += '\tGreedy Coverage Score: %s\tGreedy Coherence Score: %s\n' % (
-                    round(greedy_scores_batch[j][i]['cov'], 3), greedy_scores_batch[j][i]['coh'])
-                if j != len(app_positions):
-                    log_str += '\tApp Response: %s\n' % history_[idx + 1]
-            self.log(log_str)
-
-    def train_self_play_rl_step(self, topics, documents, histories, reverse, turn):
-        # sampling
-        sample_utterances, RL_log_probs = self.make_utterance(topics, documents, histories, greedy=False)
-        # greedy baseline
-        with torch.autograd.no_grad():
-            greedy_utterances, _ = self.make_utterance(topics, documents, histories, greedy=True)
-        sample_rewards, sample_scores = self.get_reward_score(documents, sample_utterances, histories, reverse=reverse,
-                                                              get_coh=(turn != 0))
-        greedy_rewards, greedy_scores = self.get_reward_score(documents, greedy_utterances, histories, reverse=reverse,
-                                                              get_coh=(turn != 0))
-        rl_loss = torch.sum(-(sample_rewards - greedy_rewards) * RL_log_probs)
-        # Self-critic policy gradient training (eq 15 in https://arxiv.org/pdf/1705.04304.pdf)
-        self.optimizer.zero_grad()
-        # rl_loss.backward()
-        self.accelerator.backward(rl_loss)
-        self.optimizer.step()
-        histories = update_history(histories, greedy_utterances, reverse=reverse)
-        if (turn != self.args.num_turns - 1):
-            # app should not respond when it's the last turn
-            app_say = bart_generate(self.app, histories, num_return_sequences=self.args.num_candicates)
-            histories = update_history(histories, app_say, reverse=reverse)
-        return histories, sample_utterances, greedy_utterances, sample_scores, greedy_scores
-
-    def train_self_play_rl(self, train_dataset, eval_dataset):
-        # Only show the progress bar once on each machine.
-        progress_bar_train = tqdm(range(int(self.args.max_train_steps / self.args.batch_size)))
-        completed_steps = 0
-        eval_epoch = 0
-        self.sel.selector.train()
-        num_steps = math.floor(len(train_dataset) / self.args.batch_size)
-        indexes = list(range(len(train_dataset)))
-        if self.args.shuffle:
-            random.shuffle(indexes)
-        for i in range(num_steps):
-            indexes_batch = indexes[i * self.args.batch_size: (i + 1) * self.args.batch_size]
-            instances = train_dataset[indexes_batch]
-            topics, documents = instances['topic'], instances['document']
-            histories = ['' for _ in range(len(topics))]
-            sample_utterances_batch, greedy_utterances_batch, sample_scores_batch, greedy_scores_batch = [], [], [], []
-            try:
-                ins_start_time = datetime.now()
-                self.log('\n### Training step %s ###' % i)
-                for j in range(self.args.num_turns):
-                    histories, sample_utterances, greedy_utterances, sample_scores, greedy_scores = self.train_self_play_rl_step(
-                        topics, documents, histories, reverse=self.args.reverse, turn=j)
-                    sample_utterances_batch.append(sample_utterances)
-                    greedy_utterances_batch.append(greedy_utterances)
-                    sample_scores_batch.append(sample_scores)
-                    greedy_scores_batch.append(greedy_scores)
-                ins_end_time = datetime.now()
-                self.log_step(histories, sample_utterances_batch, greedy_utterances_batch, sample_scores_batch,
-                              greedy_scores_batch)
-                self.log('Per batch time: %s\tTotal time consumed: %s' % (
-                    str(ins_end_time - ins_start_time), str(ins_end_time - self.start_time)))
-            except:
-                self.log('Failed training case, idx %s' % i)
-                self.log('Topic:\t%s' % topics)
-                self.log('Document:\t%s' % documents)
-            progress_bar_train.update(1)
-            completed_steps += 1
-            if completed_steps % self.args.eval_steps == 0:
-                self.log('--- Eval epoch %s starts ---' % eval_epoch)
-                eval_epoch += 1
-                self.eval_self_play_rl(eval_dataset)
-            if completed_steps % self.args.save_steps == 0:
-                self.sel.save_model(self.args.output_dir, '/step_%s' % i)
-            if completed_steps >= self.args.max_train_steps:
-                break
-
-    def eval_self_play_rl(self, eval_dataset):
-        eval_start_time = datetime.now()
-        progress_bar_eval = tqdm(range(int(len(eval_dataset) / self.args.batch_size)))
-        indexes = list(range(len(eval_dataset)))
-        num_steps = math.ceil(len(eval_dataset) / self.args.batch_size)
-        self.sel.selector.eval()
-        scores_cov_all = []
-        scores_coh_all = []
-        for i in range(num_steps):
-            indexes_batch = indexes[i * self.args.batch_size: (i + 1) * self.args.batch_size]
-            instances = eval_dataset[indexes_batch]
-            topics, documents = instances['topic'], instances['document']
-            histories = ['' for _ in range(len(topics))]
-            try:
-                for j in range(self.args.num_turns):
-                    with torch.autograd.no_grad():
-                        utterances, _ = self.make_utterance(topics, documents, histories, greedy=True)
-                    rewards, scores_batch = self.get_reward_score(documents, utterances, histories,
-                                                                  reverse=self.args.reverse, get_coh=(j != 0))
-                    for scores in scores_batch:
-                        scores_cov_all.append(scores['cov'])
-                        scores_coh_all.append(scores['coh'])
-            except:
-                self.log('Failed eval case, idx %s' % j)
-                self.log('Topic:\t%s' % topics)
-                self.log('Document:\t%s' % documents)
-            progress_bar_eval.update(1)
-        self.log('--- Eval average coverage score: %f ---' % (np.mean(scores_cov_all)))
-        self.log('--- Eval average coherence score: %f ---' % (np.mean(scores_coh_all)))
-        eval_end_time = datetime.now()
-        self.log('--- Eval time consumed: %s ---' % str(eval_end_time - eval_start_time))
-        self.sel.selector.train()
+from transformers import AutoModelWithLMHead, BartTokenizer, AutoTokenizer
+from tqdm import tqdm
+import sys
+import os
+from utils.self_play_infra_utils import get_linear_schedule_with_warmup
+from utils.self_play_model_utils import bleu, DataloaderRL
 
 
 class RLTrainerForGenerator:
@@ -448,8 +40,13 @@ class RLTrainerForGenerator:
         self.start_time = datetime.now()
         if not os.path.exists(self.args.output_dir):
             os.mkdir(self.args.output_dir)
+        if hasattr(args, 'do_post_process'):
+            if args.do_post_process:
+                self.post_processor = PostProcessor()
+        else:
+            self.post_processor = None
 
-    def generate_wiz_response(self, topics, histories, documents):
+    def generate_wiz_response(self, topics, histories, documents, do_post_process=False, do_resampling=False):
         source = ['%s. %s' % (topic, history) for topic, history in zip(topics, histories)]
         source_ = self.wiz.tokenizer(source, return_tensors='pt', truncation=True, padding=True)
         source_ids, source_mask = source_['input_ids'].to(self.accelerator.device), source_['attention_mask'].to(
@@ -464,6 +61,7 @@ class RLTrainerForGenerator:
                                                         attention_mask=(source_mask, doc_mask),
                                                         encoder_outputs=(source_reps, doc_reps),
                                                         num_beams=3,
+                                                        min_length=9,
                                                         max_length=self.args.max_target_length,
                                                         early_stopping=True,
                                                         do_sample=True,
@@ -471,8 +69,18 @@ class RLTrainerForGenerator:
                                                         top_k=50,
                                                         top_p=0.9,
                                                         num_return_sequences=1,
+                                                        decoder_start_token_id=0,
+                                                        repetition_penalty=1.2,
                                                         )
-        responses_all = self.wiz.tokenizer.batch_decode(predicted_ids, skip_special_tokens=True)
+        if not do_post_process:
+            responses_all = self.wiz.tokenizer.batch_decode(predicted_ids, skip_special_tokens=True)
+        else:
+            predicted_ids_ = torch.cat((predicted_ids[:, 0].reshape(1, -1), predicted_ids[:, 2:]), dim=1)
+            responses_all = self.wiz.tokenizer.batch_decode(predicted_ids_, skip_special_tokens=True)
+            responses_all_ = []
+            for response, document in zip(responses_all, documents):
+                responses_all_.append(self.post_processor.post_process(response, document))
+            responses_all = responses_all_
         return responses_all
 
     def generate_wiz_response_finetune(self, source_ids, doc_ids, source_mask, doc_mask, do_sample=False, config=None):
@@ -482,7 +90,8 @@ class RLTrainerForGenerator:
         batch_size, _ = source_ids.shape
         predict_ids = torch.full(
             (batch_size, 1),
-            config.decoder_start_token_id,
+            0,
+            # config.decoder_start_token_id,
             dtype=torch.long,
             device=next(self.wiz.generator.parameters()).device,
         )
@@ -855,4 +464,428 @@ class RLTrainerForGenerator:
             documents = ['None' for _ in source]
         documents_ = ['chat: %s document: %s' % (s, d) for s, d in zip(source, documents)]
         return documents_
+
+
+class PostProcessor:
+    def __init__(self):
+        self.tokenizer = AutoTokenizer.from_pretrained("flexudy/t5-base-multi-sentence-doctor")
+        self.model = AutoModelWithLMHead.from_pretrained("flexudy/t5-base-multi-sentence-doctor")
+
+    def post_process(self, response, document):
+        sents_doc = document.split('. ')
+        sents_doc = '{' + '}{'.join(sents_doc) + '}'
+        input_text = "repair_sentence: %s context: %s </s>" % (response, sents_doc)
+        input_ids = self.tokenizer.encode(input_text, return_tensors="pt")
+        with torch.no_grad():
+            outputs = self.model.generate(input_ids, max_length=128, num_beams=1)
+        sentence = self.tokenizer.decode(outputs[0], skip_special_tokens=True, clean_up_tokenization_spaces=True)
+        return sentence
+
+
+# class RLTrainerForSelector:
+#     def __init__(self, args, wiz, app, sel, scorers, alphas, optimizer, accelerator):
+#         self.args = args
+#         self.wiz = wiz
+#         self.app = app
+#         self.sel = sel
+#         assert len(scorers) == len(alphas)
+#         # assert sum(alphas) == 1.0
+#         self.scorers = scorers
+#         self.alphas = alphas
+#         self.optimizer = optimizer
+#         self.accelerator = accelerator
+#         self.wiz.generator.eval()
+#         self.app.generator.eval()
+#         self.scorer_c = CoverageScorer(max_cov_score=args.max_cov_score)
+#         if not args.log_dir.endswith('.txt'):
+#             self.log_dir = args.log_dir + '/log.txt'
+#         else:
+#             self.log_dir = args.log_dir
+#         with open(self.log_dir, 'w') as f:
+#             f.write('***** Running RL Fine-tuning *****\n')
+#         self.start_time = datetime.now()
+#         if not os.path.exists(self.args.output_dir):
+#             os.mkdir(self.args.output_dir)
+#
+#     def log(self, content):
+#         with open(self.log_dir, 'a') as f:
+#             f.write(content.strip() + '\n')
+#         print(content.strip() + '\n')
+#
+#     def tokenize_doc(self, documents):
+#         if type(documents) == str:
+#             references = sent_tokenize(documents)
+#         else:
+#             assert type(documents) == list
+#             references = [sent_tokenize(document) for document in documents]
+#         return references
+#
+#
+# class RLTrainerForSelectorConv(RLTrainerForSelector):
+#     '''
+#     The reward is back propagated after each conversation is finished
+#     '''
+#
+#     def __init__(self, args, wiz, app, sel, scorers, alphas, optimizer, accelerator):
+#         super().__init__(args, wiz, app, sel, scorers, alphas, optimizer, accelerator)
+#
+#     def get_reward_score(self, history, document):
+#         scores = {}
+#         for scorer, alpha in zip(self.scorers, self.alphas):
+#             if type(scorer) is CoverageScorer:
+#                 score_cov = scorer.score_conversation(history, document)
+#                 scores['cov'] = alpha * score_cov
+#             elif type(scorer) is CoherenceScorer:
+#                 score_coh = scorer.score_conversation(history)
+#                 scores['coh'] = alpha * score_coh
+#             else:
+#                 raise NotImplementedError
+#         return sum(scores.values()), scores
+#
+#     def make_conversation(self, topic, document, reverse=True, greedy=False):
+#         raise NotImplementedError
+#
+#     def train_self_play_rl_step(self, idx, topics, documents):
+#         ins_start_time = datetime.now()
+#         # sampling
+#         sample_histories, RL_log_probs = self.make_conversation(topics, documents, reverse=self.args.reverse,
+#                                                                 greedy=False)
+#         with torch.autograd.no_grad():
+#             # greedy baseline
+#             greedy_histories, _ = self.make_conversation(topics, documents, reverse=self.args.reverse, greedy=True)
+#         sample_rewards_batch, sample_scores_batch = self.get_reward_score(sample_histories, documents)
+#         baseline_rewards_batch, greedy_scores_batch = self.get_reward_score(greedy_histories, documents)
+#         rl_loss = -(sample_rewards_batch - baseline_rewards_batch) * RL_log_probs
+#         self.log('\n### Training step %s ###' % idx +
+#                  '\nSample conversation:\t%s\nSample reward:\tCoverage - %f\tCoherence - %f' % (
+#                      '</s>'.join(sample_histories), sample_scores_batch['cov'], sample_scores_batch['coh']) +
+#                  '\nBaseline conversation\t%s\nBaseline reward:\tCoverage - %f\tCoherence - %f' % (
+#                      '</s>'.join(greedy_histories), greedy_scores_batch['cov'], greedy_scores_batch['coh']) +
+#                  '\nCoverage difference: %f\tCoherence difference: %f' %
+#                  (sample_scores_batch['cov'] - greedy_scores_batch['cov'],
+#                   sample_scores_batch['coh'] - greedy_scores_batch['coh'])
+#                  )
+#         ins_end_time = datetime.now()
+#         self.log('Per instance time: %s\tTotal time consumed: %s' % (
+#             str(ins_end_time - ins_start_time), str(ins_end_time - self.start_time)))
+#         # Self-critic policy gradient training (eq 15 in https://arxiv.org/pdf/1705.04304.pdf)
+#         # rl_loss = torch.mean(rl_loss)
+#         # batch_reward = torch.mean(sample_reward).item()
+#         self.optimizer.zero_grad()
+#         # rl_loss.backward()
+#         self.accelerator.backward(rl_loss)
+#         self.optimizer.step()
+#
+#     def train_self_play_rl(self, train_dataset, eval_dataset):
+#         # Only show the progress bar once on each machine.
+#         progress_bar_train = tqdm(range(int(self.args.max_train_steps / self.args.batch_size)))
+#         completed_steps = 0
+#         eval_epoch = 0
+#         self.sel.selector.train()
+#         num_steps = math.floor(len(train_dataset) / self.args.batch_size)
+#         indexes = list(range(len(train_dataset)))
+#         if self.args.shuffle:
+#             random.shuffle(indexes)
+#         for i in range(num_steps):
+#             indexes_batch = indexes[i * self.args.batch_size: (i + 1) * self.args.batch_size]
+#             instances = train_dataset[indexes_batch]
+#             topics, documents = instances['topic'], instances['document']
+#             try:
+#                 self.train_self_play_rl_step(i, topics, documents)
+#             except:
+#                 self.log('Failed training case, idx %s' % i)
+#                 self.log('Topic:\t%s' % topics)
+#                 self.log('Document:\t%s' % documents)
+#             progress_bar_train.update(1)
+#             completed_steps += 1
+#             if completed_steps % self.args.eval_steps == 0:
+#                 self.log('--- Eval epoch %s starts ---' % eval_epoch)
+#                 eval_epoch += 1
+#                 self.eval_self_play_rl(eval_dataset)
+#             if completed_steps % self.args.save_steps == 0:
+#                 self.sel.save_model(self.args.output_dir, '/step_%s' % i)
+#             if completed_steps >= self.args.max_train_steps:
+#                 break
+#
+#     def eval_self_play_rl(self, dataset):
+#         eval_start_time = datetime.now()
+#         progress_bar_eval = tqdm(range(len(dataset)))
+#         self.sel.selector.eval()
+#         all_scores_cov = []
+#         all_scores_coh = []
+#         for j, instance in enumerate(dataset):
+#             topic, document = instance['topic'], instance['document']
+#             try:
+#                 with torch.autograd.no_grad():
+#                     history, _ = self.make_conversation(topic, document, reverse=self.args.reverse, greedy=True)
+#                 reward, scores = self.get_reward_score(history, document)
+#                 self.log('\n--- Eval step %s ---' % j +
+#                          '\nConversation:\t%s\nReward:\t%f' % (
+#                              '</s>'.join(history), reward))
+#                 all_scores_cov.append(scores['cov'])
+#                 all_scores_coh.append(scores['coh'])
+#             except:
+#                 self.log('Failed eval case, idx %s' % j)
+#                 self.log('Topic:\t%s' % topic)
+#                 self.log('Document:\t%s' % document)
+#             progress_bar_eval.update(1)
+#         self.log('--- Eval average coverage score: %f ---' % (np.mean(all_scores_cov)))
+#         self.log('--- Eval average coherence score: %f ---' % (np.mean(all_scores_coh)))
+#         eval_end_time = datetime.now()
+#         self.log('--- Eval time consumed: %s ---' % str(eval_end_time - eval_start_time))
+#         self.sel.selector.train()
+#
+#
+# class RLTrainerForPostSelectorConv(RLTrainerForSelectorConv):
+#     def __init__(self, args, wiz, app, sel, scorers, alphas, optimizer, accelerator):
+#         super().__init__(args, wiz, app, sel, scorers, alphas, optimizer, accelerator)
+#
+#     def make_conversation(self, topic, document, reverse=True, greedy=False):
+#         history = ""
+#         log_probs = []
+#         for i in range(self.args.num_turns):
+#             wiz_say_candidates = doha_generate(self.wiz, topic, history, document,
+#                                                num_return_sequences=self.args.num_candicates)
+#             probs = self.sel.select(wiz_say_candidates, history, document)
+#             if not greedy:
+#                 multi_dist = Categorical(probs)
+#                 idx_candidate = multi_dist.sample()
+#                 log_prob = multi_dist.log_prob(idx_candidate)
+#                 log_probs.append(log_prob)
+#             else:
+#                 idx_candidate = torch.argmax(probs)
+#             wiz_say = wiz_say_candidates[idx_candidate]
+#             history = update_history(history, wiz_say, reverse=reverse)
+#             if i != self.args.num_turns - 1:  # the app do not need to response in the last turn
+#                 app_say = bart_generate(self.app, history, num_return_sequences=self.args.num_candicates)
+#                 history = update_history(history, app_say, reverse=reverse)
+#         history = parse_conversation_history(history, reverse=reverse)
+#         if not greedy:
+#             log_probs = torch.stack(log_probs)
+#             log_probs = torch.sum(log_probs)
+#         return history, log_probs
+#
+#
+# class RLTrainerForPreSelectorConv(RLTrainerForSelectorConv):
+#     def __init__(self, args, wiz, app, sel, scorers, alphas, optimizer, accelerator):
+#         super().__init__(args, wiz, app, sel, scorers, alphas, optimizer, accelerator)
+#
+#     def make_conversation_old(self, topic, document, reverse=True, greedy=False):
+#         history = ""
+#         log_probs = []
+#         sents_doc = sent_tokenize(document)
+#         for i in range(self.args.num_turns):
+#             probs = self.sel.select(sents_doc, history, document)
+#             if not greedy:
+#                 multi_dist = Categorical(probs)
+#                 idx_sent = multi_dist.sample()
+#                 while idx_sent == torch.argmax(probs) and len(sents_doc) > 1:
+#                     idx_sent = multi_dist.sample()
+#                 log_prob = multi_dist.log_prob(idx_sent)
+#                 log_probs.append(log_prob)
+#             else:
+#                 idx_sent = torch.argmax(probs)
+#             wiz_say = doha_generate(self.wiz, topic, history, sents_doc[idx_sent], num_return_sequences=1)[0]
+#             history = update_history(history, wiz_say, reverse=reverse)
+#             if i != self.args.num_turns - 1:  # the app do not need to response in the last turn
+#                 app_say = bart_generate(self.app, history, num_return_sequences=self.args.num_candicates)
+#                 history = update_history(history, app_say, reverse=reverse)
+#         history = parse_conversation_history(history, reverse=reverse)
+#         if not greedy:
+#             log_probs = torch.stack(log_probs)
+#             log_probs = torch.sum(log_probs)
+#         return history, log_probs
+#
+#     def make_conversation(self, topics, documents, reverse=True, greedy=False):
+#         histories = ['' for _ in range(len(topics))]
+#         references = self.tokenize_doc(documents)
+#         log_probs = None
+#         for i in range(self.args.num_turns):
+#             probs_batch = self.sel.select(references, histories, documents)
+#             if not greedy:
+#                 multi_dist = Categorical(probs_batch)
+#                 idx_sent = multi_dist.sample()
+#                 # force the sampler to select sth different from the baseline
+#                 # while idx_sent == torch.argmax(probs_batch) and len(references) > 1:
+#                 #     idx_sent = multi_dist.sample()
+#                 log_prob = multi_dist.log_prob(idx_sent)
+#                 log_probs.append(log_prob)
+#             else:
+#                 idx_sent = torch.argmax(probs_batch)
+#             sents = [references[i][idx_sent[i]] for i in range(len(idx_sent))]
+#
+#
+# class RLTrainerForSelectorUttr(RLTrainerForSelector):
+#     '''
+#     The reward is back propagated after each conversation is finished
+#     '''
+#
+#     def __init__(self, args, wiz, app, sel, scorers, alphas, optimizer, accelerator):
+#         super().__init__(args, wiz, app, sel, scorers, alphas, optimizer, accelerator)
+#
+#     def make_utterance(self, topics, documents, histories, greedy):
+#         references = self.tokenize_doc(documents)
+#         probs_batch = self.sel.select(references, histories, documents)
+#         log_probs = None
+#         if not greedy:
+#             multi_dist = Categorical(probs_batch)
+#             idx_sent = multi_dist.sample()
+#             # force the sampler to select sth different from the baseline
+#             # while idx_sent == torch.argmax(probs_batch) and len(references) > 1:
+#             #     idx_sent = multi_dist.sample()
+#             log_probs = multi_dist.log_prob(idx_sent).to(self.sel.device)
+#         else:
+#             idx_sent = torch.argmax(probs_batch, dim=1)
+#         sents = [references[i][idx_sent[i]] for i in range(len(idx_sent))]
+#         wiz_say = doha_generate(self.wiz, topics, histories, sents, num_return_sequences=1)
+#         return wiz_say, log_probs
+#
+#     def get_reward_score(self, documents, utterances, histories, reverse, get_coh):
+#         if type(documents) == str:
+#             # input is a single instance
+#             scores = {}
+#             for scorer, alpha in zip(self.scorers, self.alphas):
+#                 if type(scorer) is CoverageScorer:
+#                     old_cov = scorer.score_utterance(histories, documents)
+#                     now_cov = scorer.score_utterance(update_history(histories, utterances, reverse=reverse), documents)
+#                     score_cov = now_cov - old_cov
+#                     scores['cov'] = alpha * score_cov
+#                 elif type(scorer) is CoherenceScorer:
+#                     if get_coh:
+#                         score_coh = scorer.score_utterance(utterances, histories)
+#                         scores['coh'] = alpha * score_coh
+#                     else:
+#                         scores['coh'] = 0.0
+#                 else:
+#                     raise NotImplementedError
+#             return sum(scores.values()), scores
+#         else:
+#             assert type(documents) == list
+#             # input is a batch
+#             rewards_batch, scores_batch = [], []
+#             for document, utterance, history in zip(documents, utterances, histories):
+#                 reward, score = self.get_reward_score(document, utterance, history, reverse, get_coh)
+#                 rewards_batch.append(reward)
+#                 scores_batch.append(score)
+#             return torch.from_numpy(np.array(rewards_batch)).to(self.sel.device), scores_batch
+#
+#     def log_step(self, histories, sample_utterances_batch, greedy_utterances_batch, sample_scores_batch,
+#                  greedy_scores_batch):
+#         for i, history in enumerate(histories):
+#             log_str = 'Conversation %s\n' % i
+#             history_ = parse_conversation_history(history, reverse=self.args.reverse)
+#             wiz_positions = [2 * i for i in range(math.ceil(len(history_) / 2))]
+#             app_positions = [2 * i + 1 for i in range(math.floor(len(history_) / 2))]
+#             for j, idx in enumerate(wiz_positions):
+#                 log_str += '\tSample: %s\n' % sample_utterances_batch[j][i]
+#                 log_str += '\tGreedy: %s\n' % greedy_utterances_batch[j][i]
+#                 log_str += '\tSample Coverage Score: %s\tSample Coherence Score: %s\n' % (
+#                     round(sample_scores_batch[j][i]['cov'], 3), sample_scores_batch[j][i]['coh'])
+#                 log_str += '\tGreedy Coverage Score: %s\tGreedy Coherence Score: %s\n' % (
+#                     round(greedy_scores_batch[j][i]['cov'], 3), greedy_scores_batch[j][i]['coh'])
+#                 if j != len(app_positions):
+#                     log_str += '\tApp Response: %s\n' % history_[idx + 1]
+#             self.log(log_str)
+#
+#     def train_self_play_rl_step(self, topics, documents, histories, reverse, turn):
+#         # sampling
+#         sample_utterances, RL_log_probs = self.make_utterance(topics, documents, histories, greedy=False)
+#         # greedy baseline
+#         with torch.autograd.no_grad():
+#             greedy_utterances, _ = self.make_utterance(topics, documents, histories, greedy=True)
+#         sample_rewards, sample_scores = self.get_reward_score(documents, sample_utterances, histories, reverse=reverse,
+#                                                               get_coh=(turn != 0))
+#         greedy_rewards, greedy_scores = self.get_reward_score(documents, greedy_utterances, histories, reverse=reverse,
+#                                                               get_coh=(turn != 0))
+#         rl_loss = torch.sum(-(sample_rewards - greedy_rewards) * RL_log_probs)
+#         # Self-critic policy gradient training (eq 15 in https://arxiv.org/pdf/1705.04304.pdf)
+#         self.optimizer.zero_grad()
+#         # rl_loss.backward()
+#         self.accelerator.backward(rl_loss)
+#         self.optimizer.step()
+#         histories = update_history(histories, greedy_utterances, reverse=reverse)
+#         if (turn != self.args.num_turns - 1):
+#             # app should not respond when it's the last turn
+#             app_say = bart_generate(self.app, histories, num_return_sequences=self.args.num_candicates)
+#             histories = update_history(histories, app_say, reverse=reverse)
+#         return histories, sample_utterances, greedy_utterances, sample_scores, greedy_scores
+#
+#     def train_self_play_rl(self, train_dataset, eval_dataset):
+#         # Only show the progress bar once on each machine.
+#         progress_bar_train = tqdm(range(int(self.args.max_train_steps / self.args.batch_size)))
+#         completed_steps = 0
+#         eval_epoch = 0
+#         self.sel.selector.train()
+#         num_steps = math.floor(len(train_dataset) / self.args.batch_size)
+#         indexes = list(range(len(train_dataset)))
+#         if self.args.shuffle:
+#             random.shuffle(indexes)
+#         for i in range(num_steps):
+#             indexes_batch = indexes[i * self.args.batch_size: (i + 1) * self.args.batch_size]
+#             instances = train_dataset[indexes_batch]
+#             topics, documents = instances['topic'], instances['document']
+#             histories = ['' for _ in range(len(topics))]
+#             sample_utterances_batch, greedy_utterances_batch, sample_scores_batch, greedy_scores_batch = [], [], [], []
+#             try:
+#                 ins_start_time = datetime.now()
+#                 self.log('\n### Training step %s ###' % i)
+#                 for j in range(self.args.num_turns):
+#                     histories, sample_utterances, greedy_utterances, sample_scores, greedy_scores = self.train_self_play_rl_step(
+#                         topics, documents, histories, reverse=self.args.reverse, turn=j)
+#                     sample_utterances_batch.append(sample_utterances)
+#                     greedy_utterances_batch.append(greedy_utterances)
+#                     sample_scores_batch.append(sample_scores)
+#                     greedy_scores_batch.append(greedy_scores)
+#                 ins_end_time = datetime.now()
+#                 self.log_step(histories, sample_utterances_batch, greedy_utterances_batch, sample_scores_batch,
+#                               greedy_scores_batch)
+#                 self.log('Per batch time: %s\tTotal time consumed: %s' % (
+#                     str(ins_end_time - ins_start_time), str(ins_end_time - self.start_time)))
+#             except:
+#                 self.log('Failed training case, idx %s' % i)
+#                 self.log('Topic:\t%s' % topics)
+#                 self.log('Document:\t%s' % documents)
+#             progress_bar_train.update(1)
+#             completed_steps += 1
+#             if completed_steps % self.args.eval_steps == 0:
+#                 self.log('--- Eval epoch %s starts ---' % eval_epoch)
+#                 eval_epoch += 1
+#                 self.eval_self_play_rl(eval_dataset)
+#             if completed_steps % self.args.save_steps == 0:
+#                 self.sel.save_model(self.args.output_dir, '/step_%s' % i)
+#             if completed_steps >= self.args.max_train_steps:
+#                 break
+#
+#     def eval_self_play_rl(self, eval_dataset):
+#         eval_start_time = datetime.now()
+#         progress_bar_eval = tqdm(range(int(len(eval_dataset) / self.args.batch_size)))
+#         indexes = list(range(len(eval_dataset)))
+#         num_steps = math.ceil(len(eval_dataset) / self.args.batch_size)
+#         self.sel.selector.eval()
+#         scores_cov_all = []
+#         scores_coh_all = []
+#         for i in range(num_steps):
+#             indexes_batch = indexes[i * self.args.batch_size: (i + 1) * self.args.batch_size]
+#             instances = eval_dataset[indexes_batch]
+#             topics, documents = instances['topic'], instances['document']
+#             histories = ['' for _ in range(len(topics))]
+#             try:
+#                 for j in range(self.args.num_turns):
+#                     with torch.autograd.no_grad():
+#                         utterances, _ = self.make_utterance(topics, documents, histories, greedy=True)
+#                     rewards, scores_batch = self.get_reward_score(documents, utterances, histories,
+#                                                                   reverse=self.args.reverse, get_coh=(j != 0))
+#                     for scores in scores_batch:
+#                         scores_cov_all.append(scores['cov'])
+#                         scores_coh_all.append(scores['coh'])
+#             except:
+#                 self.log('Failed eval case, idx %s' % j)
+#                 self.log('Topic:\t%s' % topics)
+#                 self.log('Document:\t%s' % documents)
+#             progress_bar_eval.update(1)
+#         self.log('--- Eval average coverage score: %f ---' % (np.mean(scores_cov_all)))
+#         self.log('--- Eval average coherence score: %f ---' % (np.mean(scores_coh_all)))
+#         eval_end_time = datetime.now()
+#         self.log('--- Eval time consumed: %s ---' % str(eval_end_time - eval_start_time))
+#         self.sel.selector.train()
 
