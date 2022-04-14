@@ -4,7 +4,7 @@ This scripts convert WoW dataset to coherence model trainig data
 import json
 import os
 
-for dtype in ['dev']:
+for dtype in ['test']:
     instances = []
     PATH_IN_WOW = '../Talk_/data/WoW-raw/%s.json' % dtype
     with open(PATH_IN_WOW) as f:

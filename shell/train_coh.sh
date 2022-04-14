@@ -1,0 +1,11 @@
+CUDA_VISIBLE_DEVICES=2 python scripts/coh_exp/train_inferconv.py \
+  --model_name_or_path bert-base-cased \
+  --task_name mnli \
+  --train_file ../Talk_/data/WoW-coherence/train.json \
+  --validation_file ../Talk_/data/WoW-coherence/dev.json \
+  --max_length 256 \
+  --per_device_train_batch_size 32 \
+  --learning_rate 2e-5 \
+  --num_train_epochs 2 \
+  --output_dir ../Talk_/saved_models/coh_1.5.1/ \
+  --label_list pos-neg
