@@ -1,4 +1,4 @@
-# Talk, do not read
+# Reinforced Dialog System For Learning
 
 This is the repo for the NAACL 2022 paper  **[Learning as Conversation: Dialogue Systems Reinforced for Information Acquisition]()**.
 
