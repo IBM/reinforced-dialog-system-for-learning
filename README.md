@@ -17,12 +17,12 @@ You may choose to download the preprocessed datasets, or build it yourself from 
 
 ### Download preprocessed datasets
 <ul>
-  <li><a href="https://ibm.box.com/s/a3791prz4go6x6drruxl0tkoxjc7vvjx">Datasets for pre-tuning the teacher bot</a></li>
-  <li><a href="https://ibm.box.com/s/2z8y30fhjpd2otffaxlcsth0yo2qyqzq">Datasets for pre-tuning the student bot</a></li>
-  <li><a href="https://ibm.box.com/s/69508lgkv5shabs4ufkb8e0s5banbgs8">Datasets for training the coherence evaluation model</a></li>
-  <li><a href="https://ibm.box.com/s/hz9bzwagz24iac98dztmhho2ewxs49sj">Datasets for fine-tuning the teacher bot on Wikipedia</a></li>
-  <li><a href="https://ibm.box.com/s/ljkyobxygv4qklsfs271m10a8myaef5d">Datasets for fine-tuning the teacher bot on CNN-DailyMail</a></li>
-  <li><a href="https://ibm.box.com/s/btye6mizoovwoathfj1u5hylvb6kkeik">Datasets for fine-tuning the teacher bot on Paper Abstracts</a></li>
+  <li><a href="https://ibm.box.com/s/katnocg311pxydz1bi0e6f58kcrwft8j">Datasets for pre-tuning the teacher bot</a></li>
+  <li><a href="https://ibm.box.com/s/gp0gvj0bwhcqoe3r2o8vtvyjn7tb4m5r">Datasets for pre-tuning the student bot</a></li>
+  <li><a href="https://ibm.box.com/s/bu2i2twsgvzcm1w6vdq5xvwt6gzjr0m8">Datasets for training/evaluating the coherence evaluation model</a></li>
+  <li><a href="https://ibm.box.com/s/0l3gztvtqcdswo0u0s8s99n1ydnh46zs">Datasets for fine-tuning the teacher bot on Wikipedia</a></li>
+  <li><a href="https://ibm.box.com/s/wpum5nnr8874do31z4ec2ze341ma335k">Datasets for fine-tuning the teacher bot on CNN-DailyMail</a></li>
+  <li><a href="https://ibm.box.com/s/twqwms3h1u8m1t8gmvuvwaey957gomfb">Datasets for fine-tuning the teacher bot on Paper Abstracts</a></li>
 </ul>
 
 ###Process the datasets yourself from scratch
@@ -76,12 +76,12 @@ python shell/prepare_data/prepare_coh-1.5.py
 ### Our pre-trained and fine-tuned model dumps
 
 <ul>
-  <li><a href="https://ibm.box.com/s/ibhpa237n34zkmkgeun40z1qi2ljndh8">Teacher bot pre-tuned on WoW dataset</a></li>
-  <li><a href="https://ibm.box.com/s/kabxkll0xbb4btuhyo0svt542pjkmgwj">Student bot pre-tuned on WoW dataset</a></li>
-  <li><a href="https://ibm.box.com/s/59q7c05vxyd3vfh0ogmfusp880p8xucg">Coherence evaluation model pre-traind on WoW-coherence dataset</a></li>
-  <li><a href="https://ibm.box.com/s/yl5xcznoih3qvi83lety1tiup4x62m0q">Teacher bot fine-tuned on Wikipedia</a></li>
-  <li><a href="https://ibm.box.com/s/e702mg4iuilthl98zbvqua5pc97jsmsl">Teacher bot fine-tuned on CNN-DailyMail</a></li>
-  <li><a href="https://ibm.box.com/s/yfe6dt7b2uzsi2b852s32zwlci8js6bf">Teacher bot fine-tuned on Paper Abstracts</a></li>
+  <li><a href="https://ibm.box.com/s/0upu1mhnrw9c0pzwl6el4vcjtsqmlx1l">Teacher bot pre-tuned on WoW dataset</a></li>
+  <li><a href="https://ibm.box.com/s/4um9kvsdy9x3qiebwqdfc1vosknj2z5h">Student bot pre-tuned on WoW dataset</a></li>
+  <li><a href="https://ibm.box.com/s/tl6m25uaur0yrgh9mch84k42csjsgz2c">Coherence evaluation model pre-traind on WoW-coherence dataset</a></li>
+  <li><a href="https://ibm.box.com/s/kde2jht9970zzmlu1feecpt3mukfdczg">Teacher bot fine-tuned on Wikipedia</a></li>
+  <li><a href="https://ibm.box.com/s/w0garm1sxsf3096njsbc6fop62dq8nch">Teacher bot fine-tuned on CNN-DailyMail</a></li>
+  <li><a href="https://ibm.box.com/s/vzwidkjopkqac0xsulp5is9w8u4twvf0">Teacher bot fine-tuned on Paper Abstracts</a></li>
 </ul>
 
 You may train your own models following two-phase procedures:
